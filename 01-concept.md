@@ -152,6 +152,44 @@ The system's job is to make it cheap to answer *"does this feature actually
 help?"* — by testing GEX alone, GEX + structure, GEX + profile, GEX +
 footprint, and so on, and discovering which components contribute nothing.
 
+## 8b. Why build rather than adopt
+
+The system is being built because a survey of existing tooling found nothing
+that covers the work this project is actually about.
+
+**What does not exist anywhere.** GEX for NSE — no platform, library or vendor
+provides it, and the dealer-positioning convention for an Indian market is
+unsolved research rather than missing software. Order-flow *features* as a
+research pipeline — Bookmap, ATAS, Sierra Chart, GoCharting and TrueData
+Velocity are charting and execution tools that display order flow, not systems
+that produce testable features from it. Historical option-chain ingestion at
+scale from Indian providers. And the research harness itself: feature
+versioning, ablation, and lineage from trade back to raw data. Indian SaaS
+backtesters (AlgoTest, Stockmock, Quantsapp) run predefined strategy templates
+and cannot express custom features at all.
+
+That set — chain-level analytics, order-flow features, and the ablation harness
+— is the entire point of the project, and none of it can be bought.
+
+**What may already exist, and is not yet ruled out.** A substantial part of the
+*plumbing* — event-driven engine, backtest/live parity, instrument abstraction
+with venue namespacing, order-book types, columnar storage — appears to be
+covered by **NautilusTrader**, with **ArcticDB** a candidate for versioned
+time-series storage. Neither has been evaluated hands-on.
+
+> ⚠ **This survey is incomplete.** It rests on prior knowledge, not a completed
+> search. Before building the engine, run the NautilusTrader spike (D-28): a
+> trivial NIFTY futures strategy, an NSE option instrument with correct
+> multiplier and expiry, a minimal Dhan adapter, and one custom chain-level
+> feature. Two days. If it fits, it closes D-05, D-17, D-18, D-28, D-29, D-32,
+> D-33 and D-38 at once — though you would inherit its data model, which may
+> fight the time-versioned market rules of `08`.
+
+**So the decision is narrower than "build everything".** The analytics and
+research layers are built because they must be. The plumbing beneath them is an
+open build-or-adopt question (D-28, D-48), and answering it with a two-day
+experiment is much cheaper than answering it with six months of engine work.
+
 ## 9. The research loop
 
 ```
