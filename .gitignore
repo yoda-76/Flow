@@ -1,0 +1,20 @@
+# Secrets — never committed, matches the CLAUDE.md rule (never read/commit .env)
+**/.env
+
+# Virtual environments
+**/.venv/
+**/venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Experiment output — scratch, not a deliverable (see CLAUDE.md)
+experiments/results/
+**/logs/
+
+# Saved webpage page-chrome assets (logos, fonts, JS) from the Breeze doc
+# dumps — some filenames are hex-encoded URLs that exceed the filesystem
+# path-length limit. The actual documentation text lives inline in the
+# .html files, not in these; safe to exclude.
+**/*_files/
