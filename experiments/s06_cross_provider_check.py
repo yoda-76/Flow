@@ -74,7 +74,14 @@ def dhan_headers() -> dict:
         print("FATAL: Dhan credentials missing from experiments/.env (DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN).")
         print("Generate at web.dhan.co -> My Profile -> Access DhanHQ APIs (24h validity).")
         sys.exit(1)
-    return {"access-token": token, "dhanClientId": client_id, "Content-Type": "application/json"}
+    # Send both spellings — Dhan's own docs are inconsistent about the header
+    # name across endpoints. Confirmed live 2026-09-06.
+    return {
+        "access-token": token,
+        "dhanClientId": client_id,
+        "client-id": client_id,
+        "Content-Type": "application/json",
+    }
 
 
 def check_dhan_auth(headers: dict) -> dict:

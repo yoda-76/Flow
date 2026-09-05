@@ -48,4 +48,16 @@ FLOW/
   `.env` myself, including indirectly (e.g. a script generating or modifying
   it).
 
+## Architecture stays provisional by design
+
+Decisions in `docs/dynamic/decisions.md` are the current best answer, not
+final — expect more experiments to reshape them (D-28's engine spike,
+D-52's expiry sourcing, and S-03/S-04/S-05 will each likely reopen
+something). When writing code in `flow/`: keep modules small, behind clear
+interfaces (adapter, cost model, market rules, feature version), so a
+bottleneck can be swapped or reworked in one place instead of triggering a
+rewrite. Don't over-abstract ahead of a second real case (per `08`), but
+never let a module's internals leak past its interface either — that's what
+makes the swap possible later.
+
 No other standing rules recorded yet.

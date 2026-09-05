@@ -265,6 +265,24 @@ the same shape of problem as the already-known `CNXBAN` (Bank Nifty) quirk in
 not just index names. Confirms a mapping table is required, not optional, for
 D-05/D-06's three-way reconciliation (Breeze / Dhan / NSE).
 
+**[LIVE] (local SecurityMaster file scan, not an API call) SecurityMaster
+does NOT contain historical/expired contracts — current+near-future
+listings only.** Scanned all 77,886 rows of `FONSEScripMaster.txt` via
+`experiments/check_securitymaster_expiry_coverage.py` for NIFTY and
+BANKNIFTY (`CNXBAN`) OPTIDX/FUTIDX expiries: earliest expiry anywhere in the
+file is `2026-08-18` — right at the file's own download date (Aug 14,
+2026). Nothing from 2021, 2024, or even earlier in 2026. **This settles
+D-52's sourcing question in the negative**: the security master cannot seed
+a historical expiry calendar, because it's a "what's tradable right now"
+snapshot, regenerated daily by design — not an archive. A real historical
+expiry calendar needs a different source (NSE's own historical
+bhavcopy/circular archives, most likely) or has to be bootstrapped
+opportunistically from the D-50 chain-pull's own responses as it runs.
+Side confirmation while scanning: `CNXBAN` (Bank Nifty) has only 4 expiries
+in the file, all monthly-spaced (`2026-08-25, 2026-09-29, 2026-10-27,
+2026-12-29`) — no weeklies at all, consistent with the discontinuation noted
+below.
+
 **[LIVE] BANKNIFTY weekly discontinuation confirmed independently.**
 `08-market-abstraction.md` notes "weekly expiry restricted to one benchmark
 index per exchange — BANKNIFTY, FINNIFTY, MIDCPNIFTY weeklies discontinued
@@ -278,7 +296,36 @@ corroborates the claim's current-state accuracy.
 
 ---
 
-## Dhan account readiness (blocks S-02/S-03/S-06 Dhan-side work)
+## S-06 — Breeze/Dhan overlap comparison (the actual R17 question)
+
+**[LIVE]** 2026-09-06, once both the Dhan subscription and a fresh Breeze
+token were in place — ran `experiments/s06_cross_provider_check.py`: NIFTY
+futures (expiry 29-Sep-2026, shared token/securityId `68407`), 2026-08-28,
+09:30–09:40 IST, pulled independently from both providers.
+
+**Result: perfect agreement.** Of the 11 requested minutes, 9 timestamps
+came back from both providers, and every single one matched **exactly** —
+close price to the decimal (e.g. `24315.1`, `24321.8`, ...) and open
+interest to the exact integer (e.g. `15003625`, `15000765`, ...) on all 9.
+This is the actual empirical answer to R17's "one continuous timeline"
+claim and S-06's explicit question ("do Breeze and Dhan 1-minute futures
+bars agree?") — on this sample, yes, without qualification. Feeds directly
+into D-12 (provenance/overlap policy, still formally BLOCKED pending a
+larger sample, but this is a strong positive first data point rather than
+the "routine disagreement" scenario the register worried about).
+
+**[LIVE] Boundary convention differs between providers — a real thing to
+handle in the adapter layer, not a bug.** Requesting `fromDate=09:30:00,
+toDate=09:40:00` from Dhan's `/v2/charts/intraday` returned only
+`09:31:00`–`09:39:00` (9 candles) — **both endpoints are exclusive.**
+Breeze, given the identical logical window, returned all 11 candles
+inclusive of both endpoints. Anyone requesting "a full session" from Dhan
+needs to pad the request window by one interval on each side to get the
+true inclusive range; Breeze needs no such padding. This is exactly the
+kind of provider-specific quirk principle #11 (adapters own provider
+logic) exists to contain — it must not leak into canonical-layer code.
+
+## Dhan account readiness (RESOLVED 2026-09-06 — subscription active)
 
 **[LIVE]** 2026-08-30 — direct REST auth against Dhan (`GET /v2/profile` with
 `access-token`/`dhanClientId` headers, per `experiments/s06_cross_provider_check.py`)
@@ -295,12 +342,155 @@ Data APIs subscription (~₹499/month, already noted in
 `04-tooling-landscape.md` §9) isn't active on this account yet. It blocks
 **all** Dhan data access: historical, live feed, everything — not just this
 one call. S-02 (Dhan-side volume), S-03 (live packet fields), and S-06's
-Breeze/Dhan overlap comparison are all stuck behind this specifically, not
-behind anything technical. The Breeze half of the S-06 comparison ran fine
-(11 rows, NIFTY futures, 2026-08-28 09:30–09:40 — `24318.0` → `24322.0`,
-OI `15003040` → `15013505`) and is sitting ready in
-`experiments/results/s06_cross_provider_20260830T091604.json` for the moment
-Dhan's side is unblocked.
+Breeze/Dhan overlap comparison were all stuck behind this specifically, not
+behind anything technical.
+
+**Resolved 2026-09-06** — the account subscribed to Dhan's Data APIs.
+Confirmed unblocked via `/v2/optionchain/expirylist` and
+`/v2/charts/rollingoption` both returning real data instead of `DH-902`
+(see the D-52 experiment below), and via a full S-06 comparison run (see
+above). S-02's Dhan-side volume numbers and S-03's live packet-field
+checks (need market hours) are the remaining unstarted work — no longer
+blocked on the subscription, just not yet run.
+
+## NSE's own historical F&O data framework (RESOLVED — closes D-52, D-46 unchanged)
+
+**[DOC]** 2026-09-06 — `https://archives.nseindia.com/content/press/Data_Details_F_n_O.pdf`
+(NSE Data & Analytics' own spec document) describes a formal historical
+data framework for the F&O segment, organized by month (`yyyymm`) with five
+sub-directories per month:
+
+- **Bhavcopy** — one file per trading day, one row per contract, pipe-
+  delimited: date, symbol, instrument type, **expiry date**, option type,
+  corporate-action flag, strike, OHLC, LTP, open interest, total traded
+  quantity/value, number of trades. **This directly answers D-52's
+  outstanding sourcing question** — every day's file lists every contract's
+  expiry date that had activity that day, which is a complete historical
+  expiry calendar as a byproduct of something NSE already publishes daily.
+- **Masters** — month-end contract master including lot size, **Token
+  Number** (same concept as the Breeze/Dhan shared token already confirmed
+  identical — see the D-05 finding above), issue start/maturity dates,
+  exercise start/end dates. Dated monthly, which is exactly the
+  time-versioned source D-06 needs for lot-size-change history — a real
+  candidate for "authoritative source" that isn't Breeze or Dhan at all.
+- **Snapshots** — full limit-order-book snapshots at several fixed times
+  per day, back to (at least) 2003 per the document's own example.
+- **Trades** — ⚠ **every single trade, every day, with trade time
+  (hh:mm:ss), price, and quantity, per contract** — described as existing
+  since 2003. **If this is genuinely accessible for historical dates, it
+  directly contradicts D-46's premise that "no historical order-flow data
+  exists from any accessible provider."** That decision was made in good
+  faith based on Breeze and Dhan being the only providers considered; NSE
+  itself was never checked.
+- **Circulars** — exactly the historical-circular archive `08` says is
+  needed to verify lot-size/expiry-day change dates rather than trusting
+  memory.
+
+**⚠ Not yet confirmed accessible.** Two measured attempts to fetch a real
+bhavcopy file (`archives.nseindia.com/content/historical/DERIVATIVES/...`)
+returned `503`, and even the plain `www.nseindia.com` homepage returned
+`403` to a bare request — consistent with NSE's well-documented bot
+protection (Akamai-style), not evidence the data itself is unavailable.
+The document's own branding ("NSE Data & Analytics") also raises a real
+question: this may describe NSE's **commercial** data-vending product
+rather than something freely downloadable from the public archive site —
+that distinction is not yet resolved either.
+
+**[LIVE] 2026-09-06 — resolved, mixed result.** Bare `curl`/browser requests
+were blocked (403/503, NSE's bot protection), but the community libraries
+`jugaad-data` and `nsepython` handle NSE's session/header requirements
+internally. Tested directly:
+
+- **Bhavcopy is real, free, and working.** `jugaad_data.nse.bhavcopy_fo_raw(date(2024, 1, 25))`
+  returned genuine 5.3MB of CSV — every F&O contract traded that day, with
+  `EXPIRY_DT`, `STRIKE_PR`, `OPTION_TYP`, OHLC, `SETTLE_PR`, `CONTRACTS`
+  (volume), `OPEN_INT`, `CHG_IN_OI`. **This closes D-52 concretely** — not
+  just "NSE archives exist," but a confirmed, working, free mechanism to
+  get the expiry calendar as a byproduct of data already being pulled.
+  Bonus: this also removes the guesswork D-50's chain pull would otherwise
+  need — bhavcopy tells you the *exact* contracts that existed on a given
+  historical day before you spend a single Breeze request on it.
+- **Trades/Snapshots (tick-level) are NOT exposed by either library** —
+  searched both for any trade/tick/snapshot/depth/orderbook function,
+  found nothing in either. Combined with the bot-protected, paid-branded
+  ("NSE Data & Analytics") nature of the original PDF, this is strong
+  evidence the 2003-era Trades/Snapshots archive is no longer freely
+  available — it was very likely folded into NSE's commercial data-vending
+  product at some point. **D-46 is NOT reopened.** Order-flow remains
+  forward-only by design, as originally decided — this was worth checking
+  rather than assuming, and the check came back negative.
+- **Masters (lot-size history) is also not exposed by either library** —
+  D-06's authoritative-source question isn't solved by this after all.
+  `08`'s original suggestion (verify lot-size change dates against exchange
+  circulars directly, rather than a data file) remains the live path for
+  D-06 — there are only a handful of known revisions historically, likely
+  more tractable to encode by hand from circulars than to find a bulk data
+  source for.
+
+---
+
+## D-52 — Dhan expiry-discovery experiment (subscription still blocking)
+
+**[LIVE]** 2026-09-06, after a fresh access token — the subscription block
+is unchanged, but two real API quirks surfaced along the way, worth fixing
+in code regardless of subscription status:
+
+- **Header-name inconsistency across Dhan's own endpoints.** `/v2/profile`
+  and `/v2/charts/intraday` accept `dhanClientId`; `/v2/optionchain/
+  expirylist`'s own doc page specifies `client-id` instead — sending only
+  `dhanClientId` to that endpoint gets back a misleading
+  `{"810": "ClientId is invalid"}` rather than the real subscription error.
+  Sending both header spellings on every request resolves it and reveals
+  the actual state underneath. Fixed in both experiment scripts.
+- **`expiryCode: 0` ("near expiry") is broken server-side.** `/v2/charts/
+  rollingoption` rejects it with `DH-905 "expiryCode is required"` — tested
+  both as JSON int `0` and string `"0"`, both fail identically. `expiryCode:
+  1` ("next expiry") passes validation and reaches the real gate
+  (`DH-902`). This looks like a classic falsy-value bug (0 treated as
+  "not provided") in Dhan's own backend, not a mistake in our request.
+  Workaround applied in `d52_dhan_expiry_discovery_check.py`; worth
+  re-testing `0` once subscribed, in case it's coincidentally tied to the
+  subscription check rather than a pure validation bug.
+
+**Net result (before subscription): the Data API subscription is the single
+blocker.** `/v2/optionchain/expirylist` correctly surfaces `{"806": "Data
+APIs not Subscribed"}`, and `/v2/charts/rollingoption` (once past the
+expiryCode bug) surfaces the same `DH-902` seen before.
+
+**[LIVE] 2026-09-06, subscription now active — full result.**
+
+- `/v2/optionchain/expirylist` for NIFTY now returns 18 distinct future
+  expiries out to `2031-06-24` — considerably further forward than the
+  downloaded SecurityMaster's snapshot (max `2027-06-29`), confirming Dhan's
+  live listing is more complete than a point-in-time SecurityMaster dump.
+  Still current+future only, exactly as documented — nothing before today.
+- `/v2/charts/rollingoption` genuinely works: pulled real hourly OHLC + OI +
+  strike + spot for NIFTY calls, `expiryFlag=WEEK`, `expiryCode=1`, from
+  2024-01-02 to 2024-01-26 — **~130 real hourly bars, ATM strike visibly
+  tracking spot as it moved from 21650 down through 22100 and back to
+  21250-21400 across the window.** This is a second, independent
+  confirmation (via Dhan, not just Breeze) that genuine 2-year-old
+  historical option data exists and is retrievable.
+- **But the response never reveals which expiry was active at any point** —
+  no expiry field anywhere in `ce`/`pe`, despite the data clearly being
+  drawn from real dated contracts underneath. Confirms the docs' own
+  warning ("must reference instrument list separately") empirically, not
+  just by reading it. **This closes D-52's experiment with a negative
+  result**: this endpoint cannot seed a historical expiry calendar, however
+  good it is for other purposes.
+- Two secondary gaps, real API behavior not a request mistake: `volume` and
+  `iv` came back as empty arrays despite being explicitly listed in
+  `requiredData`, while `oi`/`strike`/`spot`/OHLC all populated correctly.
+  Worth checking whether these are ever populated for this endpoint before
+  relying on them.
+- The endpoint returns one option side per call (`pe: null` here since only
+  `CALL` was requested) — same two-calls-per-side shape as Breeze's
+  `get_option_chain_quotes`.
+- **`expiryCode=0` bug confirmed independent of subscription state** — it
+  failed with `DH-905` identically both before and after the subscription
+  activated; `expiryCode=1` is the correct workaround regardless.
+
+---
 
 ## D-27 — Option chain as object or query (evidence, not a decision)
 

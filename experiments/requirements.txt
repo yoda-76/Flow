@@ -1,2 +1,5 @@
 breeze-connect
 python-dotenv
+requests
+jugaad-data
+nsepython
