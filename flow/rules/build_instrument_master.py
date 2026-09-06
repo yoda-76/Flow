@@ -94,22 +94,24 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
     expiry_first_seen = {}   # (underlying, instrument_type, expiry) -> first date observed
 
     days_scanned, days_skipped = 0, 0
+    legacy_days_scanned = 0
     transition_days = []      # informational only -- see module docstring
     token_reuse_warnings = []  # a token mapping to >1 instrument_id over the scan
 
     for d in trading_days(start, end):
         try:
-            raw = fetch_fo_bhavcopy(d)
+            raw, is_legacy = fetch_fo_bhavcopy(d)
         except ValueError:
             days_skipped += 1
             continue
-        rows = parse_fo_bhavcopy(raw, underlyings=underlyings, instrument_types=instrument_types)
+        rows = parse_fo_bhavcopy(raw, is_legacy, underlyings=underlyings, instrument_types=instrument_types)
         days_scanned += 1
+        legacy_days_scanned += is_legacy
 
         seen_lot_today = {}
         for row in rows:
-            token = row["FinInstrmId"]
-            lot = int(float(row["NewBrdLotQty"]))
+            token = row["FinInstrmId"]  # None pre-UDiFF (legacy format has no token column)
+            lot = int(float(row["NewBrdLotQty"])) if row["NewBrdLotQty"] is not None else None
             underlying = row["TckrSymb"]
             itype = row["FinInstrmTp"]
             expiry = row["XpryDt"]
@@ -123,7 +125,8 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
                 "strike": strike, "option_type": option_type,
             })
 
-            seen_lot_today.setdefault(underlying, set()).add(lot)
+            if lot is not None:
+                seen_lot_today.setdefault(underlying, set()).add(lot)
 
             key = (underlying, itype, expiry)
             if key not in expiry_first_seen:
@@ -135,18 +138,39 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
 
     # --- instrument master: one row per (contract, stable-spec period) ---
     instrument_rows = []
+    lot_size_backfilled = []  # instrument_ids whose earliest days predate any known lot size (legacy era)
     for iid, days in instrument_days.items():
         static = instrument_static[iid]
         is_option = static["option_type"] in ("CE", "PE")
-        # token should be constant across a single instrument_id's life --
-        # confirm rather than assume, and surface it if it ever isn't.
-        tokens_seen = {t for _, _, t in days}
+        # token should be constant across a single instrument_id's life
+        # (excluding None -- legacy days never have one) -- confirm rather
+        # than assume, and surface it if it ever isn't.
+        tokens_seen = {t for _, _, t in days if t is not None}
         if len(tokens_seen) > 1:
             token_reuse_warnings.append(f"{iid}: {len(tokens_seen)} different tokens observed: {tokens_seen}")
-        exchange_token = sorted(tokens_seen)[-1]  # most recent if it ever did change
+        exchange_token = sorted(tokens_seen)[-1] if tokens_seen else None
 
-        lot_days = sorted((d, lot) for d, lot, _ in days)
-        for period in collapse_periods(lot_days):
+        true_valid_from = min(d for d, _, _ in days)
+        lot_days = sorted((d, lot) for d, lot, _ in days if lot is not None)
+        if lot_days:
+            periods = collapse_periods(lot_days)
+            if periods[0]["valid_from"] > true_valid_from:
+                # This instrument_id was observed earlier than any known lot
+                # size (pre-UDiFF legacy days, which have no lot-size
+                # column at all) -- backward-extend the earliest known
+                # value rather than leave a gap. NIFTY's lot size is stable
+                # for long stretches (confirmed: 25 held from well before
+                # 2024-07-08 through 2024-11-22), so this is a reasonable,
+                # explicitly-logged assumption, not a silent one.
+                lot_size_backfilled.append(f"{iid}: backfilled lot_size={periods[0]['value']} to {true_valid_from} (legacy era, no lot-size column)")
+                periods[0]["valid_from"] = true_valid_from
+        else:
+            # Never observed with a known lot size at all -- contract
+            # existed and expired entirely within the legacy era. Can't
+            # source a real value; leave it null rather than guess.
+            periods = [{"value": None, "valid_from": true_valid_from, "valid_to": max(d for d, _, _ in days)}]
+
+        for period in periods:
             instrument_rows.append({
                 "instrument_id": iid,
                 "exchange_token": exchange_token,
@@ -190,8 +214,10 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
             "instrument_master": len(instrument_df),
             "expiry_calendar": len(calendar_df),
         },
+        "legacy_days_scanned": legacy_days_scanned,
         "lot_size_transition_days": transition_days,
         "token_reuse_within_one_instrument_id": token_reuse_warnings,
+        "lot_size_backfilled_from_legacy_era": lot_size_backfilled,
         "content_hashes": {
             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in (instrument_path, calendar_path)
@@ -199,7 +225,7 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
 
-    print(f"Scanned {days_scanned} trading days ({days_skipped} skipped as holiday/weekend/unpublished)")
+    print(f"Scanned {days_scanned} trading days ({legacy_days_scanned} legacy-format, {days_skipped} skipped as holiday/weekend/unpublished)")
     print(f"Instrument master: {len(instrument_df)} rows ({instrument_df['exchange_token'].nunique() if not instrument_df.empty else 0} distinct contracts)")
     print(f"Expiry calendar: {len(calendar_df)} rows")
     if transition_days:
@@ -210,6 +236,9 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
         print(f"\n{len(token_reuse_warnings)} instrument_ids saw their exchange_token change mid-life (unexpected, worth checking):")
         for w in token_reuse_warnings[:5]:
             print(" ", w)
+    if lot_size_backfilled:
+        print(f"\n{len(lot_size_backfilled)} instrument_ids had lot_size backfilled into the legacy era (no lot-size column pre-2024-07-08):")
+        print(" ", lot_size_backfilled[0])
     print(f"\nWritten to {out_dir}")
 
 

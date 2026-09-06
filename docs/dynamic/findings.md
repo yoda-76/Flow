@@ -543,6 +543,68 @@ settled first, which is exactly what this test is narrowing down.
 
 ---
 
+## D-06/D-52 — bhavcopy coverage extended back to Jan 2024 (legacy + UDiFF)
+
+**[LIVE]** 2026-09-07 — the instrument master and expiry calendar
+previously only covered the UDiFF era (2024-07-08 onward, `findings.md`'s
+earlier D-50 section). Extended `flow/rules/bhavcopy.py` to also handle
+NSE's legacy (pre-UDiFF) bhavcopy format, per the user's request for full
+Jan 2024 coverage ahead of the actual Breeze historical pull.
+
+Confirmed live: `jugaad_data.nse.bhavcopy_fo_raw()` (the function whose
+*post*-2024-07-08 behavior was already found dead — findings.md, D-50)
+works correctly for dates *before* the cutover. Its column set is
+genuinely different and **missing two things the UDiFF format has**: no
+token/instrument-id column at all, and no lot-size column (`NewBrdLotQty`)
+at all. Both formats do carry expiry/strike/right, so instrument identity
+and the expiry calendar are unaffected — only lot-size and exchange_token
+are unavailable for legacy-era-only observations.
+
+Handled by: backward-extending each contract's earliest *known* lot size
+(from its first UDiFF-era observation) into its legacy-era days, logged
+explicitly per instrument rather than silently assumed — reasonable given
+NIFTY's lot size is confirmed stable for long stretches (25, unchanged
+from well before 2024-07-08 through 2024-11-22). For the further edge
+case — a contract that existed and expired **entirely** within the legacy
+era, with no later observation to infer from — lot_size is left `null`
+rather than guessed, correctly flagged as an unavoidable, honest gap
+(WARNING, not CRITICAL, in `store.py`'s validation).
+
+**Full rebuild, Jan 1 2024 → 2026-09-07**: 661 trading days scanned (125
+legacy-format, 40 holidays/weekends skipped), 31,513 instrument-period
+rows across 18,756 distinct contracts, 206 expiry-calendar entries, 1,658
+instrument_ids backfilled. Validation clean except the expected WARNING
+(5,150 rows genuinely unbackfillable, legacy-era-only contracts).
+`rules_as_of()` still correctly returns
+`[2026-09-08, 2026-09-15, 2026-09-22]`.
+
+## R25 — Breeze can return literally negative volume (real data-quality bug)
+
+**[LIVE]** 2026-09-06 — first real run of `flow/canonical/build.py` +
+`validate_canonical()` (D-44) against the Aug 3-4 2026 sample (193
+instruments, 136,867 rows) caught a genuine Breeze data error: one bar
+for `NIFTY 2026-08-04 27100 PE` (10:30 IST, Aug 4) has `"volume": -65`
+paired with `"open_interest": 65` in Breeze's raw response — confirmed
+straight from the saved raw JSON, not introduced by parsing. Deep-ITM/
+illiquid strike, flat OHLC (single stale print). One isolated row out of
+136,867, but a real, live confirmation that R25's validation requirement
+("invalid volume") isn't a theoretical checklist item — it's already
+needed on real data, on the very first canonical build attempted.
+**Also confirmed working as designed**: the instrument-master cross-check
+(`cross_check_against_instrument_master`) passed cleanly on all 193
+instruments — the identity-construction logic in `canonical/build.py`
+(built from Breeze's own row fields) agrees exactly with the
+bhavcopy-derived instrument master (`rules/build_instrument_master.py`)
+built independently through a completely different pipeline.
+
+**Fixed, 2026-09-07** (per user instruction): the negative-volume bar is
+no longer kept as-is or zeroed — `canonical/build.py` now nulls it out
+during the raw→canonical build step itself, treated as "volume unknown for
+this bar", not "zero trades" and not "-65 trades". `validate_canonical()`
+now only asserts negative volume can't survive the build (would be a
+CRITICAL if it ever did) and separately reports the null count as an
+informational WARNING.
+
 ## D-05 — exchange_token is NOT a stable, permanent identifier (correction)
 
 **[LIVE]** 2026-09-06, discovered while building `flow/rules/build_instrument_master.py`
@@ -975,6 +1037,59 @@ requires at least 2 of {`expiry_date`, `right`, `strike_price`}, and omitting
 unlike Dhan's). Useful as a cheap, request-light cross-check against Dhan's
 live chain — 2 calls per underlying+expiry (one per side) rather than one
 call per strike.
+
+---
+
+**[LIVE/CODE]** NIFTY index spot, full history downloaded and built —
+`flow/adapters/download_index.py` (2-day chunking via
+`flow/adapters/chunking.py`, resumable by checking each raw file for a
+non-empty `Success` list) pulled 2024-01-01 through 2026-09-04, 1-minute
+bars. 419 chunks attempted, 408 succeeded, 11 came back with an empty
+`Success`/`Error: None` — all 11 land on known NSE holidays or the
+in-progress current session day, not real failures (cross-checked: canonical
+build reports exactly 661 distinct trading days, matching the instrument
+master's independently-scanned trading-day count for the same range
+exactly). Built to canonical (`flow/canonical/build.py`) and persisted
+partitioned by `(instrument_type, year, month)` per D-03
+(`flow/canonical/write.py`, new — idempotent merge-and-dedupe on
+`(timestamp, instrument_id)` per partition, so re-running an overlapping
+pull never duplicates rows): 252,366 rows, `instrument_id = NSE|NIFTY|INDEX`,
+validation clean except one expected WARNING (99.9% zero-volume bars — index
+spot's `volume` field from Breeze isn't a real traded-volume series, matches
+the small-scale smoke test's same finding, not a data-quality bug).
+
+**[LIVE/CODE]** NIFTY front-month futures, full history downloaded and
+built — `flow/adapters/download_futures.py` (new), front-month resolved per
+trading day via `rules/store.py`'s new `front_contract()` (nearest expiry
+>= t among instrument-master contracts actually trading on t — a pure
+function of observed data, no rollover-weekday rule). 2024-01-01 through
+2026-09-04: 419 chunks, 407 succeeded, 12 empty responses all landing on
+known holidays (same cross-check as the index: exact 661-trading-day count
+match). Rollover boundaries verified correct on a smoke test spanning the
+2024-01-25 expiry (days 22-25 pulled the expiring contract, day 26 onward
+pulled the next one).
+
+Found a second real Breeze data-quality bug while validating (distinct from
+the earlier negative-volume one): a single response can contain **two
+conflicting rows for the same (timestamp, instrument_id)** — confirmed on
+NIFTY's 2025-06-26 future, 2025-06-20 14:33: one row `volume=5250`, the
+other `volume=-1543350` (nonsense), with slightly different OHLC too.
+`canonical/build.py` now dedupes: within a duplicate group, keep the row
+with a plausible (non-negative) volume if exactly one side qualifies,
+otherwise keep the last-seen row. Also caught (and fixed by deleting the
+stray raw file, not a code change): a leftover raw file from an earlier
+rollover smoke test whose date-chunk boundary didn't match the full run's
+own chunking, causing genuine double-counted rows for one day — a reminder
+that raw file *names* under a given contract directory must stay mutually
+exclusive by date range, not just individually correct.
+
+After the fix: 248,280 canonical rows, 33 instrument_ids, cross-checked
+clean against the instrument master, validation clean (one expected
+WARNING: 53 rows with unknown volume, nulled per the existing negative-
+volume policy).
+
+Next: front-weekly options download, per D-50's already-computed budget
+(~89.2K requests at 2-day chunking, 18 days at the 5,000/day cap).
 
 ---
 

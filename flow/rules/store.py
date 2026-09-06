@@ -73,6 +73,23 @@ class MarketRulesStore:
                 return None
         return rows.sort_values("valid_to").iloc[-1].to_dict()
 
+    def front_contract(self, underlying: str, t: date, instrument_type: str = "IDF") -> str | None:
+        """The front-month/front-week contract instrument_id actually
+        trading on date t -- nearest expiry >= t among contracts of this
+        underlying/instrument_type whose observed [valid_from, valid_to]
+        covers t. A pure function of the instrument master (no separate
+        rollover rule needed: "front" just means nearest live expiry).
+        Returns None if nothing of this type was trading on t."""
+        inst = self.instruments
+        t_iso = t.isoformat()
+        candidates = inst[
+            (inst["underlying"] == underlying) & (inst["instrument_type"] == instrument_type)
+            & (inst["valid_from"] <= t) & (inst["valid_to"] >= t) & (inst["expiry"] >= t_iso)
+        ]
+        if candidates.empty:
+            return None
+        return candidates.sort_values("expiry").iloc[0]["instrument_id"]
+
     def rules_as_of(self, market: str, underlying: str, t: date, rule_type: str = "expiry",
                      instrument_type: str = "IDO", n: int = 1) -> list:
         """
@@ -118,8 +135,14 @@ def validate(store: MarketRulesStore) -> list:
     overlapping = [iid for iid, g in inst.groupby("instrument_id") if len(g) > 1 and _has_overlap(g)]
     if overlapping:
         issues.append(f"CRITICAL: {len(overlapping)} instrument_ids have overlapping valid_from/valid_to periods: {overlapping[:5]}")
-    if inst["lot_size"].isna().any() or (inst["lot_size"] <= 0).any():
-        issues.append(f"CRITICAL: {(inst['lot_size'].isna() | (inst['lot_size'] <= 0)).sum()} rows with missing/non-positive lot_size")
+    if (inst["lot_size"] <= 0).any():
+        issues.append(f"CRITICAL: {(inst['lot_size'] <= 0).sum()} rows with non-positive lot_size")
+    null_lot = inst["lot_size"].isna().sum()
+    if null_lot:
+        # Legitimate for contracts that existed and expired entirely within
+        # the pre-UDiFF legacy era, which has no lot-size column at all --
+        # not backfillable (build_instrument_master.py's docstring).
+        issues.append(f"WARNING: {null_lot} rows with no known lot_size (expected for legacy-era-only contracts, not backfillable)")
     bad_periods = inst[inst["valid_from"] > inst["valid_to"]]
     if not bad_periods.empty:
         issues.append(f"CRITICAL: {len(bad_periods)} rows with valid_from after valid_to")
