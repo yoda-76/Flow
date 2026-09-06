@@ -68,6 +68,11 @@ DECIDED · TRIAL · PARKED · DROPPED.
 | D-53 | One gex_config object per market, in feature version | DECIDED | 2026-09-06 | — |
 | D-54 | Get seams right, implement only NSE | DECIDED | 2026-09-06 | — |
 | D-55 | Single accessor + lightweight custom hardcode check | DECIDED | 2026-09-06 | — |
+| D-01 | Parquet source of truth + DuckDB query layer | DECIDED | 2026-09-06 | findings.md D-28 |
+| D-03 | Partition by (instrument_type, year, month) | DECIDED | 2026-09-06 | findings.md D-50 |
+| D-06 | NSE bhavcopy (jugaad-data) as authoritative source | DECIDED | 2026-09-06 | findings.md |
+| D-07 | Tz-aware Asia/Kolkata; bar-labelled-by-open | DECIDED | 2026-09-06 | findings.md S-01 |
+| D-12 | Provenance fields; compare-but-don't-block | DECIDED | 2026-09-06 | findings.md S-06 |
 
 ---
 
@@ -188,6 +193,14 @@ which won't exist for a future non-NSE market and works against the
 market-abstraction goal in `08`. Keeping the composite string primary
 preserves debuggability and market-agnosticism; `exchange_token` captures the
 reconciliation shortcut as a secondary field rather than throwing it away.
+**Empirically vindicated, 2026-09-06** (`findings.md`, D-05 correction):
+building the real instrument master found NSE recycles `exchange_token`
+values for unrelated contracts after expiry, and can even reissue a new
+token for the same contract terms after a delist/relist gap. Grouping by
+token as primary identity (the rejected alternative) would have silently
+merged unrelated contracts; the composite string doesn't have this
+failure mode. `exchange_token` stays useful for same-day cross-provider
+matching, just confirmed unsafe as a permanent historical key on its own.
 
 ### D-17 — Feature engine execution model
 
@@ -631,14 +644,17 @@ answering before it's needed.
 **Decision:** Start with 1 year of NIFTY front-weekly chain history; widen
 (more years, BANKNIFTY, wider strikes) only after this validates the
 pipeline end-to-end.
-**Rationale:** `findings.md` (S-02) corrected the original "~6 weeks for 5
-years" estimate to roughly ~6 months for the same scope, since the real
-weekly ladder (~462 contracts) is ~4.6× wider than the ~100 originally
-assumed. A bounded 1-year pull (~5-7 weeks of pulling at the real contract
-count) proves the raw→canonical→GEX pipeline works before committing to a
-multi-month operation. Also gated on D-49's token handling and D-52's
-expiry-calendar sourcing being resolved enough to know which expiries to
-pull.
+**Rationale:** `findings.md` (S-02) initially corrected the original "~6
+weeks for 5 years" estimate to roughly ~6 months for the same scope, using
+the ~462-contract count from a live SecurityMaster snapshot. That was
+itself superseded the same day by an exact measurement (`findings.md`,
+D-50 section): pulling 247 real trading days of NSE bhavcopy and counting
+the actual front-weekly contract count per day (real range 160-328,
+volatility-dependent) gives **1 year = 51,500 requests = ~11 days at
+5,000/day**, roughly half the SecurityMaster-based estimate. Exact
+per-window numbers (1/3/6/9/12 months) are in `findings.md`. Also gated on
+D-49's token handling and D-52's expiry-calendar sourcing (now itself
+resolved via the same bhavcopy mechanism).
 
 ### D-51 — Market rules as time-versioned data
 
@@ -661,18 +677,28 @@ one way, an inline constant stands out immediately.
 **Status:** DECIDED
 **Date:** 2026-09-06
 **Decision:** A dated calendar table (not a computed rule), sourced from
-NSE's own historical bhavcopy — confirmed working via the `jugaad-data`
-Python library (`jugaad_data.nse.bhavcopy_fo_raw(date)`), which handles
-NSE's bot-protected archive access internally.
+NSE's own historical bhavcopy.
 **Rationale:** Mechanism was never controversial. Sourcing took three real
 experiments to close: SecurityMaster ruled out (current-listings-only
 snapshot), Dhan's `/v2/charts/rollingoption` ruled out (real historical
 data, but never reveals which expiry was active), then NSE's own bhavcopy
-confirmed genuinely working — real 25-Jan-2024 data pulled with
-`EXPIRY_DT`, strike, OHLC, `OPEN_INT`, and volume per contract, for free,
-via a maintained community library rather than fighting NSE's bot
-protection directly. Every plausible shortcut was ruled out by evidence,
-not assumption, before landing on the one that actually works.
+confirmed genuinely working. Every plausible shortcut was ruled out by
+evidence, not assumption, before landing on the one that actually works.
+**Correction (2026-09-06, same day):** the first version of this decision
+said the mechanism was `jugaad_data.nse.bhavcopy_fo_raw()`. That only
+works for dates **before** NSE's UDiFF migration (2024-07-08) — confirmed
+it fails ("File is not a zip file") for any recent date, which is exactly
+the range D-50's actual pull needs. The library's `bhavcopy_udiff_raw()`
+also doesn't help — it's equity (CM) only, not F&O. The real mechanism,
+confirmed working for recent dates in `nse_bhavcopy_year_scan.py`, is
+fetching `https://archives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{ymd}_F_0000.csv.zip`
+directly (reusing `jugaad_data`'s `NSEArchives` session for the
+bot-protection handling, not its bundled bhavcopy function), with column
+names `TckrSymb`/`XpryDt`/`StrkPric`/`OptnTp`/`FinInstrmTp` (`IDO`/`IDF`
+for index options/futures) rather than the old format's names. See
+`findings.md`'s D-50 section for the full detail — this correction was
+caught immediately by testing against a recent date before trusting the
+mechanism for anything, not discovered later.
 **Bonus, not the original ask:** bhavcopy also removes the guesswork from
 D-50's chain pull — it lists the exact contracts active on a historical
 day before spending a single Breeze request, rather than probing strikes
@@ -767,6 +793,79 @@ two-day experiment, not a debate.
 **Note:** This belongs in `experiments/` as a concrete next spike, same
 category as the Breeze/Dhan checks already run — not a documentation
 exercise.
+
+### D-01 — Canonical storage format
+
+**Status:** DECIDED
+**Date:** 2026-09-06
+**Decision:** Parquet files as the immutable source of truth; DuckDB as
+the query layer on top.
+**Rationale:** Confirmed working on real data in the D-28 spike, not just
+assumed — 31x compression (1.77MB vs 55MB raw JSON) on a real 193-instrument
+chain sample, and all three realistic query patterns (full chain at a
+timestamp, one instrument's series, end-of-window snapshot) ran in under
+65ms. Files stay portable and DuckDB reads them natively with no import
+step, keeping the query engine swappable later without touching storage.
+
+### D-03 — Partitioning scheme
+
+**Status:** DECIDED
+**Date:** 2026-09-06
+**Decision:** Partition Parquet files by `(instrument_type, year, month)`.
+**Rationale:** Real volume numbers now exist (`findings.md` D-50): up to
+~460 contracts/week, tens of MB/day for a full options chain, several
+GB/year. Equity/index/futures/options have genuinely different volumes and
+query patterns, so splitting by type first avoids scanning irrelevant data;
+month-level chunks keep file counts reasonable without being so coarse a
+query re-scans a whole year.
+
+### D-06 — Instrument master storage and time-awareness
+
+**Status:** DECIDED
+**Date:** 2026-09-06
+**Decision:** NSE bhavcopy (via `jugaad-data`, direct UDiFF URL — see
+`findings.md` D-50 section for the exact mechanism) is the authoritative
+source for time-versioned contract specs, including lot size.
+Valid_from/valid_to history is built by diffing consecutive bhavcopy pulls.
+**Rationale:** Verified live, not assumed: pulled bhavcopy across 2026 and
+2024-2025 and found NIFTY's lot size genuinely changed on record —
+**25 → 75 → 65** — landing exactly in the window `08-market-abstraction.md`
+flagged for the "late-2024 SEBI minimum-contract-value increase." This is
+the same mechanism already validated for D-52's expiry calendar, so one
+pipeline now serves both — the originally-assumed fallback (manual circular
+encoding) is superseded, not needed.
+
+### D-07 — Timestamp convention
+
+**Status:** DECIDED
+**Date:** 2026-09-06
+**Decision:** Canonical timestamps are timezone-aware `Asia/Kolkata`
+throughout, not UTC. A bar's timestamp labels its **open**, not its close.
+Millisecond precision is reserved for raw live events (D-39); canonical
+bars stay at their native resolution (1-second or 1-minute per D-08).
+**Rationale:** Matches every piece of CODE/LIVE evidence gathered this
+session — the working equity pipeline's established convention, and every
+single Breeze/Dhan response pulled during this project's testing (first
+candle of any session is always `09:15`). Storing UTC internally would only
+pay off once a second market exists, and D-54 already decided not to build
+for that yet — this keeps the seam (timezone as a field, not a hardcoded
+assumption, per the market-rules store) without paying a conversion cost
+that has no current beneficiary.
+
+### D-12 — Provenance and Breeze/Dhan overlap policy
+
+**Status:** DECIDED
+**Date:** 2026-09-06
+**Decision:** Every canonical record carries `source`, `ingest_time`, and
+`dataset_version` (the D-13 manifest reference). Where Breeze and Dhan
+overlap, run an automatic comparison and log discrepancies, but don't block
+promotion to canonical on disagreement.
+**Rationale:** The one real sample so far (`findings.md` S-06: NIFTY
+futures, 2026-08-28, all 9 overlapping candles) showed **exact** agreement
+on both price and OI. Treating disagreement as the exceptional case to
+investigate — rather than a routine gate — matches what the evidence
+actually shows so far. Revisit toward a stricter policy if a larger sample
+ever shows real, routine disagreement.
 
 ### D-18 — One implementation for historical and live, or two?
 

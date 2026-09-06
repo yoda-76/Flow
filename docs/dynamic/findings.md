@@ -353,6 +353,478 @@ above). S-02's Dhan-side volume numbers and S-03's live packet-field
 checks (need market hours) are the remaining unstarted work — no longer
 blocked on the subscription, just not yet run.
 
+## D-28 — NautilusTrader spike, part 1 (instrument + data ingestion)
+
+**[LIVE]** 2026-09-06 — the `04-tooling-landscape.md` §8 spike, run against
+a real 2-day sample (NIFTY, front-week expiry 2026-08-04, 226 contracts
+pulled from Breeze — 193 with real data, 33 empty). Full pipeline exercised:
+Breeze pull → raw JSON (D-02) → canonical Parquet (D-04/D-05) → DuckDB
+queries → NautilusTrader ingestion.
+
+**Parquet + DuckDB (D-01), on real chain-shaped data — strong result.**
+136,867 rows, 193 instruments, built from raw JSON in ~1-3.6s. Parquet:
+1.77MB vs 55MB raw JSON (**31x compression**). All three realistic query
+patterns fast: full chain at one timestamp (191/193 rows — 2 genuinely
+missing at that exact minute, real D-11 "rows absent" behavior, not a
+bug) in 53-62ms; one instrument's full series in 11-17ms; end-of-window OI
+snapshot in 10-14ms. This is a solid, real-data confirmation of D-01's
+decision, not just a single-instrument toy example.
+
+**Spike question #1 (can you define an NSE option with correct
+multiplier/lot/expiry?): yes, cleanly.** `OptionContract` takes
+`multiplier`, `lot_size`, `strike_price`, `option_kind` (PUT/CALL),
+`underlying`, `expiration_ns`, `exchange` (ISO 10383 MIC), and an `info`
+dict for extras. `InstrumentId` is `Symbol.Venue` — market-namespaced by
+construction, confirming the `04-tooling-landscape.md` claim directly
+rather than trusting it. **Caveat: no native time-versioning.** Each
+`OptionContract` is a fixed snapshot — if a lot size changes, Nautilus
+doesn't version that itself; our own D-51 rules store would still need to
+construct and swap in the correct `Instrument` object for whatever period
+is active. Nautilus doesn't fight this, but doesn't solve it either.
+
+**⚠ Real bug found: NautilusTrader 1.231.0 is broken under pandas 3.x,
+despite declaring `pandas>=2.3.3,<4.0.0` support.** `BarDataWrangler.process()`
+failed with `ValueError: buffer source array is read-only` — pandas 3.0
+made Copy-on-Write permanent and non-optional, so `.values`/`.to_numpy()`
+now return read-only arrays by default, even from a brand-new DataFrame
+built from a freshly-allocated writable numpy array (confirmed directly,
+not DuckDB-specific). Neither `.copy()` nor `to_numpy(copy=True)` into a
+new DataFrame fixes it — pandas re-imposes the read-only view regardless.
+Nautilus's Cython wrangler reads the buffer via a raw memoryview, which
+bypasses whatever pandas mechanism would normally trigger a real copy.
+**Fix: pin `pandas<3`** (tested working at `2.3.3`, their own declared
+minimum) — this is a real gap in Nautilus's declared compatibility range,
+not a mistake in our code. Same "verify the metadata, don't trust it"
+lesson already hit twice with Breeze and Dhan, now a third time with a
+different kind of dependency (library compatibility claims, not API docs).
+
+**Gap found: `open_interest` is not natively carried through the standard
+Bar pipeline.** `BarDataWrangler.process()` only accepts
+`open/high/low/close/volume` — confirmed by reading its actual docstring
+and by testing (OI present in our source data, silently absent from the
+resulting `Bar` objects since it was never passed in). For an
+options/GEX-centric project this matters a lot. Not yet resolved: whether
+Nautilus's custom-data mechanism (`@customdataclass` or similar, per
+`04-tooling-landscape.md`'s general claim about extensibility) can carry
+OI alongside bars, or whether OI needs to live entirely outside Nautilus's
+data model in our own feature layer. This is directly relevant to spike
+question #3 (attaching a custom chain-level feature like GEX) — not yet
+tested.
+
+**ParquetDataCatalog confirmed real, not just a name.** `catalog.write_data()`
++ read-back round-tripped 714 bars and 1 instrument correctly. It manages
+its own internal Parquet layout (`data/option_contract/...`,
+`data/bar/...`, filenames encoding the covered time range in nanosecond
+timestamps) — it is **not** a matter of pointing it at our own canonical
+Parquet files directly; ingestion goes through Nautilus's own object model
+(`Instrument`, `Bar`) first, catalog storage is downstream of that, not a
+replacement for our own canonical layer.
+
+**Update, same day — this is much more substantial than a plain OHLC test
+suggested.** Digging past the Bar pipeline into `nautilus_trader.model`
+found a real, shipped options-analytics subsystem, not just generic
+plumbing:
+
+- **`GreeksData`** (`@customdataclass`): delta, gamma, vega, theta, IV,
+  strike, expiry, multiplier, underlying price, cost of carry, interest
+  rate — a full per-contract Greeks record, versioned/timestamped like any
+  other Nautilus data.
+- **`PortfolioGreeks`**: the same fields with real `__add__`/`__rmul__`
+  operators — genuine portfolio-level Greeks aggregation, not just a data
+  container.
+- **`black_scholes_greeks(s, r, b, vol, is_call, k, t)`** — Generalized
+  Black-Scholes with an explicit cost-of-carry parameter `b`. This is a
+  direct, working answer to D-19/D-21's open question: Black-76 on futures
+  (`b=0`) and standard Black-Scholes on spot (`b=r`) are **the same
+  function**, just a parameter choice — not two implementations to choose
+  between.
+- **`imply_vol_and_greeks(s, r, b, is_call, k, t, price)`** — a real IV
+  solver, directly relevant to D-19/S-04's "IV solver failures" checklist
+  item.
+- **`GreeksCalculator`** — wired into the shared cache/clock, accessible
+  from any strategy/actor, for live instrument- and portfolio-level Greeks.
+  Documented honest limitation: American options are treated as European
+  for Greeks purposes — irrelevant for NSE (European-only, per D-19's
+  market check) but would matter for a future ES/SPX profile.
+- **`YieldCurveData`**: a discount-rate curve type with interpolation —
+  covers D-19's "risk-free rate source" input as a first-class,
+  timestamped, versionable object rather than a bare constant.
+
+**What's still genuinely ours to build:** raw open interest is not a
+native Nautilus concept (Greeks are *computed* from price+vol, OI is a raw
+market observable — a different kind of thing), and GEX itself
+(gamma × OI × multiplier, dealer-convention sign, chain/market-level
+aggregation) is nowhere in the package. This is the expected, correct
+split — Nautilus supplies the pricing/Greeks plumbing, we build the
+actually-novel analytics on top, exactly matching `01-concept.md` §8b's
+original framing.
+
+**Tested directly, not inferred: can OI follow the same `@customdataclass`
+pattern as `GreeksData`?** Yes — built a minimal `OpenInterestData` custom
+type, converted all 714 real OI observations for one contract (genuinely
+varying: 0 → 1105 → 455 across the window, not trivial zeros), wrote to
+the catalog, read back. **All 714 values matched exactly**, timestamps
+included. Two real bugs surfaced and fixed in the process, both about
+timestamp unit handling, neither a Nautilus problem:
+- `pd.DatetimeIndex(...).astype('int64')` silently produced garbage
+  (a 1970 date) — needed the Series-level `.astype(...)` instead.
+- **DuckDB's `.df()` now returns `datetime64[us]` (microsecond precision),
+  not pandas' traditional `datetime64[ns]`** — a bare `.astype('int64')`
+  silently gave epoch-microseconds, 1000x too small for the nanoseconds
+  Nautilus expects everywhere. Must convert to `datetime64[ns]` explicitly
+  before extracting epoch-int64. Worth remembering for any future
+  DuckDB→Nautilus (or DuckDB→anything-expecting-ns) conversion code.
+
+**Net assessment of D-28 so far**: meaningfully more promising than the
+first OHLC-only pass suggested. The instrument model, Greeks/pricing
+subsystem, and custom-data mechanism (proven for OI, not just assumed)
+together cover a large fraction of what §8's spike was checking for.
+**Not yet tested: a minimal Dhan adapter, and whether a genuinely
+aggregated feature like GEX can attach to market state during a live
+backtest run** (this OI test proves storage/round-trip, not runtime
+consumption by a strategy) — real remaining gaps before D-28 can close.
+
+---
+
+## D-19/D-21 — Greeks verification against Dhan's live chain
+
+**[LIVE]** 2026-09-06 — first empirical test of the D-19 claim "Dhan
+supplies greeks on its live chain." Confirmed real: `POST
+/v2/optionchain` (`UnderlyingScrip`, `UnderlyingSeg`, `Expiry`) returns, per
+strike, `greeks.{delta,gamma,theta,vega}` and `implied_volatility` alongside
+price/OI — not just a documentation claim, genuine live values (e.g. NIFTY
+ATM call, 2026-09-08 expiry: delta=0.5292, gamma=0.00144, theta=-20.61,
+vega=8.90, IV=12.34%).
+
+**Compared against our own pipeline** (Nautilus's `imply_vol_and_greeks` /
+`black_scholes_greeks`, spot-based, flat 6.5% rate proxy, no dividend
+adjustment — a first-pass convention, not D-19/D-21's final answer) on two
+contracts: the near-dated (2.5 days to expiry) and a 30-day-out one.
+
+| | Dhan | Ours (our IV) | Ours (Dhan's IV) |
+|---|---|---|---|
+| **2.5d: delta** | 0.5292 | 0.5137 | 0.5155 |
+| **2.5d: vega** | 8.896 | 7.840 | 7.839 |
+| **30d: delta** | 0.6260 | 0.5721 | 0.5831 |
+| **30d: vega** | 26.469 | 27.095 | 26.947 |
+
+**Key isolation: even feeding Dhan's own stated IV directly into our
+formula (bypassing our IV-solving step entirely), delta is still off by
+~8-9% on the 30-day contract.** This rules out "our implied-vol solver is
+wrong" as the explanation — vega actually matches well at 30 days (27.10 vs
+26.47, ~2% off) once Dhan's own IV is used, but delta persistently doesn't.
+That pattern — vega roughly right, delta systematically off, formula
+correctness therefore not in question — points at the underlying-reference
+or rate assumption, not the Black-Scholes math itself. Using plain spot
+with no dividend/cost-of-carry adjustment is the most likely fixable
+cause: NIFTY options are commonly priced off the futures-implied forward
+rather than raw spot, which is exactly D-21's open question.
+**Next concrete step, not yet run:** repeat this same comparison using the
+NIFTY futures price with `b=0` (Black-76, per the `black_scholes_greeks`
+signature's cost-of-carry parameter — see the D-28 findings above) instead
+of spot with `b=r`, and see whether that closes the delta gap.
+
+**Precision note confirmed along the way:** using a precise fractional
+time-to-expiry (`now` → 15:30 IST on expiry day) instead of a crude integer
+day count measurably improved the 2.5-day contract's match (theta gap
+shrank from Dhan=-20.61 vs ours=-31.24 down to -20.61 vs -25.49) — for a
+near-expiry option, T precision matters enough to change the comparison
+meaningfully. Confirms this is a real methodological detail for D-19, not
+a nicety.
+
+**Limitation, unavoidable, already known from D-52's earlier test:** this
+only validates the **live** case. Dhan has no historical greeks for
+expired contracts (its rolling-option endpoint's `iv` field came back
+empty in the D-52 test). For historical data the formula/pipeline has to
+be trusted from this live validation — Black-Scholes doesn't change over
+time, so if the pipeline is right here, it stays right historically,
+*provided* the input conventions (rate source, underlying reference) are
+settled first, which is exactly what this test is narrowing down.
+
+---
+
+## D-05 — exchange_token is NOT a stable, permanent identifier (correction)
+
+**[LIVE]** 2026-09-06, discovered while building `flow/rules/build_instrument_master.py`
+from ~2.2 years of NIFTY bhavcopy (2024-07-08 to 2026-09-06). This
+**corrects** the earlier S-06 finding that Breeze's `Token` and Dhan's
+`securityId` are "the same NSE-assigned number" — that's still true as a
+snapshot-in-time fact (confirmed on 3 contracts, same day), but two
+further things are now confirmed that change what it's safe to build on:
+
+1. **NSE recycles `FinInstrmId` (exchange token) numbers for unrelated
+   contracts after expiry.** Token `47520` was three completely different
+   contracts across the scan: `2024-12-19 26500 CE` (Dec 2024, lot 25),
+   `2025-09-23 23200 CE` (Aug 2025, lot 75), `2026-01-20 23900 PE` (Jan
+   2026, lot 65) — different expiries, different strikes, even different
+   option types. A build script that grouped by raw token (an early
+   version of this one did) silently merged three unrelated contracts into
+   one fake multi-period "instrument" — caught immediately by a validation
+   check (D-44's philosophy earning its keep in practice, not just in
+   principle) rather than discovered later in a backtest.
+2. **Even the same contract terms can get a new token after a delist/relist
+   gap.** `NSE|NIFTY|2026-06-30|22000|CE` used token `58626` from
+   2025-08-01 to 2025-12-30, then nothing for 3 months (likely delisted —
+   a deep-OTM, far-dated monthly strike), then reappeared under a *new*
+   token `79509` from 2026-04-01 onward. Same economic contract, new
+   token — a milder, real, and different phenomenon from (1).
+
+**This is exactly why D-05 chose the composite string as the primary
+`instrument_id` and relegated the shared token to a secondary field** —
+now empirically necessary, not just theoretically preferable. Had D-05
+gone the other way (token as primary id), this would have been a silent,
+serious correctness bug rather than a caught-and-fixed one.
+**`exchange_token` remains useful** for same-day/current cross-provider
+matching (which is all S-06 ever actually tested) — just not safe as a
+permanent historical identifier on its own.
+
+## D-06 — bhavcopy's lot-size field reflects genuine historical changes
+
+**[LIVE]** 2026-09-06 — checked whether `NewBrdLotQty` in the UDiFF F&O
+bhavcopy (already the D-52 mechanism) genuinely tracks historical lot-size
+changes, rather than repeating a current/static value backward. Pulled
+NIFTY futures' lot size across 7 dates spanning 2024-07 to 2026-08:
+
+| Date | Lot size |
+|---|---|
+| 2024-07-10 | 25 |
+| 2024-12-02 | 75 |
+| 2025-01-06 | 75 |
+| 2025-04-01 | 75 |
+| 2025-07-01 | 75 |
+| 2026-01-02 | 65 |
+| 2026-08-28 | 65 |
+
+**Genuinely changed on record: 25 → 75 (between Jul and Dec 2024) → 65
+(between Jul 2025 and Jan 2026).** The first jump lands exactly in the
+window `08-market-abstraction.md` already flagged from memory ("the
+late-2024 SEBI minimum-contract-value increase") — now confirmed from real
+exchange data rather than recollection. The second change wasn't
+previously known/flagged anywhere in the doc set — a real example of
+exactly the kind of silent historical change principle #16 and D-51 exist
+to catch. **This closes D-06's sourcing question**: bhavcopy is a genuine,
+free, dated source for contract-spec history, not just expiry dates —
+same mechanism, same pipeline, no manual circular encoding needed.
+
+**Refinement, found building `flow/rules/build_instrument_master.py`**:
+grandfathering during a lot-size transition isn't universal or permanent.
+`NSE|NIFTY|2025-03-27|18000|CE` (one single, continuously-listed contract,
+same token throughout) started at lot size 25 and was force-migrated to 75
+on 2025-12-27, *before its own expiry* — i.e. some already-listed
+contracts got their lot size changed mid-life, not just grandfathered
+until expiry. Confirms the earlier per-contract design (D-06's decision:
+instrument master, not a per-underlying date rule) was the right call —
+a per-underlying rule genuinely cannot represent this case either, since
+it's a change to one specific existing contract, not a rule about new
+listings.
+
+**First real build, full result**: `flow/rules/build_instrument_master.py`
+run over the full available UDiFF history (2024-07-08 to 2026-09-06, NIFTY
+index futures+options) — 536 trading days scanned (29 holidays/weekends
+skipped), 26,363 instrument-period rows (18,756 distinct contracts), 173
+expiry-calendar entries. Validation (D-44) clean after two real bugs
+caught and fixed (the token-recycling merge above, and a validation-logic
+bug that flagged legitimate multi-period instruments as "duplicates").
+`rules_as_of("NSE", "NIFTY", today, n=3)` independently returns
+`[2026-09-08, 2026-09-15, 2026-09-22]` — matching Dhan's `expirylist`
+result from the earlier D-52 experiment exactly, a clean cross-check that
+the whole pipeline is self-consistent.
+
+---
+
+## D-19 — formula correctness, verified against an independent reference (not Dhan)
+
+**[LIVE]** 2026-09-06 — `experiments/d19_formula_reference_check.py`. The
+earlier "our formula is correct" claim (from the Dhan-comparison test
+below) was an inference from a black-box comparison, not a real proof —
+worth being precise about that distinction. This test is the actual rigorous
+check: compares Nautilus's `black_scholes_greeks`/`imply_vol_and_greeks`
+against `py_vollib` (an independent, separately-authored reference
+library) on 6 synthetic scenarios (textbook + NIFTY-like ATM/OTM/ITM,
+2.5 days to 6 months to expiry) — **pure synthetic inputs, zero real
+market data, so no Dhan/Breeze staleness, no spot-vs-forward ambiguity, no
+solved-IV uncertainty possible.**
+
+**Result: matches to near machine precision across the board.**
+Price/delta/gamma/vega within ~1e-6 in every scenario; theta within
+~0.003-0.016 out of values around -5 to -22 (i.e. <0.1% relative —
+consistent with tiny differences in each library's internal normal-CDF
+approximation, not a methodology gap). **Max relative difference across
+all 6 scenarios × 5 metrics: 0.069%.** The IV-solver round-trip (price →
+implied vol → recovered original vol) is exact to ~1e-7 in every case.
+(First run showed huge theta/vega "mismatches" — traced to an unnecessary
+×365/×100 rescaling in the test script itself, not Nautilus; the two
+libraries already share the same conventions once that's removed.)
+
+**This decisively separates two previously-conflated questions.** The math
+— Black-Scholes/Black-76 via Nautilus's cost-of-carry parameterization,
+and the IV solver — is now verified correct, independent of any real-market
+noise. The earlier Dhan-comparison finding (delta off ~8-9%, vega close)
+is therefore cleanly attributable to an **input-convention** difference
+(rate source, underlying reference) rather than any doubt about the
+formula itself. That's exactly what the put-call-parity test below is
+chasing, and what still needs Monday's live market to resolve properly.
+
+## D-19/D-21 — forward derivation via put-call parity (weekend, inconclusive but instructive)
+
+**[LIVE]** 2026-09-06 (Saturday, market closed) — `experiments/d19_forward_derivation_test.py`.
+Rather than guess or fetch an external futures price (NIFTY futures are
+monthly-only, so no matching-tenor future exists for a weekly option
+anyway), derived the exact forward Dhan is implicitly pricing off directly
+from their own quotes: put-call parity, `F = (C - P) × e^(rT) + K`, across
+5 strikes near ATM, for both the nearest weekly (2.46 days) and a
+monthly-like (30.46 days) expiry.
+
+**Result is genuinely mixed, and the reason why matters:**
+- **30-day expiry**: forward-based greeks (Black-76, `b=0`, using the
+  derived forward) moved delta *closer* to Dhan's real values than
+  spot-based did, across all 5 strikes (e.g. ATM: Dhan=0.6260,
+  spot-based=0.5831, forward-based=0.5922 — closes about a quarter of the
+  gap). Implied annualized cost-of-carry: 7.56% — a realistic number for
+  NIFTY futures basis.
+- **2.46-day expiry**: forward-based greeks were *worse* than spot-based
+  at every strike (e.g. ATM: Dhan=0.5292, spot=0.5155, forward=0.6036 —
+  spot was closer). Implied annualized cost-of-carry: **40.29%** — not a
+  plausible real financing rate, a red flag the input data itself is bad
+  here, not that the forward-adjustment idea is wrong.
+- **Root cause, not just a guess**: per-strike implied forwards for the
+  30-day expiry were dispersed across a **264-point range**
+  (23931–24195) that should be nearly flat in a clean market. That
+  dispersion, plus the impossible 40% carry rate on the near-dated expiry,
+  is consistent with exactly what was anticipated going in — **stale,
+  non-synchronous last-traded prices** (a call and its paired put may have
+  last traded at different moments Friday; put-call parity assumes
+  simultaneous prices, so non-synchronous last-trade noise gets amplified
+  into a large, spurious "forward," especially for a short-T contract
+  where dividing by a small T inflates any noise into a huge annualized
+  number).
+- **Confirmed directly, not assumed: Dhan's option chain is genuinely
+  frozen on the weekend.** Re-queried the same chain 20 seconds apart —
+  spot and every Greek were byte-identical. So further repeated pulls this
+  weekend cannot produce a second, independent data point; a real repeat
+  test needs Monday's live market.
+
+**Conclusion: this specific test is inconclusive on the weekend, for a
+real and now-understood reason, not a dead end.** The forward-adjustment
+direction (closes gap at 30 days, realistic carry rate there) is
+encouraging; the near-dated result is explained by data staleness, not
+evidence against the hypothesis. **Next step, needs live market hours**:
+repeat during Monday's session, ideally using bid/ask midpoint rather than
+last-traded price to reduce the same non-synchronicity noise even when the
+market is genuinely live (thinly-traded strikes can still have stale
+last-trades intraday, just less severely than after 1.5 days closed).
+
+**Side finding: Dhan's own market-feed caches have inconsistent weekend
+availability.** `/v2/marketfeed/ltp` served frozen data fine for the NIFTY
+index (`IDX_I`) but returned empty for the NIFTY future (`NSE_FNO`,
+security id 68407) despite a well-formed, spec-matching request — meaning
+different Dhan endpoints/segments cache weekend data differently. Worth
+remembering when the recorder (D-37) has to handle a market-closed period
+gracefully — "empty" doesn't uniformly mean "no data exists," it can also
+mean "this particular cache doesn't serve stale values."
+
+## S-02 — Dhan-side raw sizing (real numbers, comparable to Breeze's)
+
+**[LIVE]** 2026-09-06 — first real Dhan-side sizing data, comparable
+directly to the Breeze figures already in this file:
+
+| | Rows | Raw bytes | Bytes/row | Breeze equivalent |
+|---|---|---|---|---|
+| NIFTY futures, 1 day, 1-min | 374 | 23,708 | **63.4** | ~166 (equity), ~166-ish (futures untested) |
+| NIFTY option (live contract), 1 day, 1-min | 374 | 21,745 | **58.1** | ~287 |
+
+**Dhan's raw JSON is roughly 2.6-4.9x more compact per row than Breeze's**,
+purely from being column-oriented (`{"open": [...], "close": [...], ...}`,
+field names appear once) versus Breeze's row-oriented shape (field names
+repeated on every row). This matters for D-01/D-45 storage planning if
+more historical pulling ever shifts toward Dhan directly, and is a fair,
+apples-to-apples comparison now that both sides have been measured the
+same way (full trading day, 1-minute, real contracts).
+
+**Also reconfirmed**: Dhan's regular `/v2/charts/intraday` does **not**
+serve already-expired option contracts (tested against a contract whose
+expiry had passed a few days earlier: `status=200` but 0 rows) — consistent
+with D-36's existing reasoning for why Breeze remains necessary for
+historical option chains; Dhan's expired-options coverage is the separate,
+ATM-relative-only `rollingoption` endpoint (see the D-52 findings above),
+not this one.
+
+---
+
+## D-50 — exact request budget, real data (not an estimate)
+
+**[LIVE]** 2026-09-06 — `experiments/nse_bhavcopy_year_scan.py` pulled 247
+real trading days of NSE F&O bhavcopy (the modern UDiFF format — see the
+URL note below) and counted the *actual* front-weekly NIFTY index-options
+contract count for every single day, rather than assuming an average.
+
+| Window | Trading days | Total Breeze requests | Days @ 5,000/day | Raw storage |
+|---|---|---|---|---|
+| 1 month | 22 | 4,726 | 1 | 0.48 GB |
+| 3 months | 64 | 13,544 | 3 | 1.36 GB |
+| 6 months | 124 | 28,870 | 6 | 2.90 GB |
+| 9 months | 185 | 40,040 | 9 | 4.03 GB |
+| 12 months | 247 | 51,500 | 11 | 5.18 GB |
+
+**[LIVE] Same-day addendum — 2-trading-day request chunking, exact numbers.**
+The working equity pipeline already chunks 2 trading days per Breeze
+request (`data_fetch_script.md`'s proven pattern: ~750 candles/request,
+under the 1,000 cap, never pairing Friday with the following Monday).
+Applying the same chunking per contract to this real dataset:
+
+| Window | Trading days | 1 req/day | 1 req/2 days | Reduction | Days @ 5,000/day |
+|---|---|---|---|---|---|
+| 2 weeks | 10 | 2,046 | 1,384 | 32% | 1 |
+| 1 month | 22 | 4,726 | 3,176 | 33% | 1 |
+| 3 months | 64 | 13,544 | 8,164 | 40% | 2 |
+| 6 months | 123 | 28,670 | 17,898 | 38% | 4 |
+| 9 months | 184 | 39,870 | 24,830 | 38% | 5 |
+| 12 months | 247 | 51,500 | 32,630 | 37% | 7 |
+
+Reduction is ~33-40%, not a flat 50% — Fridays still go solo, and **14 of
+149 weekly chunk-pairs couldn't actually combine**: the contract count
+changed mid-pair because NIFTY's weekly expiry weekday has shifted more
+than once during this exact year (matches the shifting-expiry-day history
+`08-market-abstraction.md` already flagged as something to verify against
+circulars, now with a concrete count of how often it actually bit a naive
+2-day chunking scheme). Those cases fall back to two single-day requests
+automatically. Both the 1-day and 2-day budgets are now computed by
+`nse_bhavcopy_year_scan.py` on every run.
+
+**This meaningfully corrects the earlier S-02 estimate.** That estimate
+used the ~462-contract count from the *live current* SecurityMaster
+snapshot as a stand-in for "a typical week" — but the real historical
+weekly count ranges from **160 to 328** depending on volatility (peaking
+around March 2026, a higher-volatility stretch; sitting closer to 170-220
+most other weeks). The live snapshot happened to be on the high side, not
+representative. Real day-by-day data more than halves the earlier ~23-day
+estimate down to **~11 days for a full year**. General lesson, consistent
+with everything else in this file: an estimate built from one sample point
+is not the same as a measurement, even when the sample is real data — this
+is exactly why `nse_bhavcopy_year_scan.py` was worth writing instead of
+trusting the earlier correction.
+
+**⚠ URL note, not obvious from `jugaad-data`'s public API:** its
+`bhavcopy_fo_raw()` hits NSE's pre-2024 legacy bhavcopy URL, which is dead
+for any date after NSE's UDiFF migration (2024-07-08) — confirmed live,
+fails with "File is not a zip file" for recent dates. Its
+`bhavcopy_udiff_raw()` only covers the **equity (CM)** segment, not F&O —
+confirmed by inspecting the actual rows returned (Sovereign Gold Bonds,
+not NIFTY). The real, working F&O UDiFF URL
+(`https://archives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{ymd}_F_0000.csv.zip`)
+was found by mirroring the CM UDiFF path's shape and confirmed by fetching
+it directly (reusing `NSEArchives`'s already-authenticated session rather
+than re-implementing NSE's bot-protection handling). Column names also
+differ from the pre-migration format: `TckrSymb`/`XpryDt`/`StrkPric`/
+`OptnTp`/`FinInstrmTp` instead of `SYMBOL`/`EXPIRY_DT`/`STRIKE_PR`/
+`OPTION_TYP`/`INSTRUMENT`. `FinInstrmTp` codes confirmed:
+`IDO` = index options, `IDF` = index futures (`STO`/`STF` presumably the
+stock equivalents, seen in passing, not confirmed). This whole finding —
+including D-52's bhavcopy mechanism — needs this corrected URL, not the
+library's own default function, to work for any date after mid-2024.
+
+---
+
 ## NSE's own historical F&O data framework (RESOLVED — closes D-52, D-46 unchanged)
 
 **[DOC]** 2026-09-06 — `https://archives.nseindia.com/content/press/Data_Details_F_n_O.pdf`

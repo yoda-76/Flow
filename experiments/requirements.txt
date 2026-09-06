@@ -3,3 +3,18 @@ python-dotenv
 requests
 jugaad-data
 nsepython
+
+# pandas MUST stay <3 -- nautilus_trader 1.231.0 declares pandas>=2.3.3,<4.0.0
+# but its Cython BarDataWrangler genuinely breaks under pandas 3.x's
+# permanent Copy-on-Write (read-only arrays even after .copy()). Confirmed
+# live 2026-09-06, see docs/dynamic/findings.md D-28 section. Pinned to
+# their own declared minimum, which is confirmed working.
+pandas==2.3.3
+pyarrow
+duckdb
+nautilus_trader
+
+# independent reference implementation, used to verify Nautilus's
+# black_scholes_greeks/imply_vol_and_greeks against a separately-authored
+# library on synthetic inputs -- see docs/dynamic/findings.md D-19 section
+py_vollib

@@ -1,0 +1,12 @@
+jugaad-data
+# Pinned <3 as a precaution: D-28 (adopt NautilusTrader?) is still open, and
+# its Cython BarDataWrangler genuinely breaks under pandas 3.x's permanent
+# Copy-on-Write (docs/dynamic/findings.md, D-28 section). 2.3.3 works fine
+# regardless of that decision's outcome, so there's no cost to pinning now
+# and a real migration cost later if we don't.
+pandas==2.3.3
+pyarrow
+duckdb
+python-dotenv
+requests
+breeze-connect

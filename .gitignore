@@ -13,6 +13,11 @@ __pycache__/
 experiments/results/
 **/logs/
 
+# Generated data outputs (flow/) — regenerable from source via the build
+# scripts (e.g. rules/build_instrument_master.py from NSE bhavcopy). Will
+# grow large once real OHLCV data lands here too.
+flow/data/
+
 # Saved webpage page-chrome assets (logos, fonts, JS) from the Breeze doc
 # dumps — some filenames are hex-encoded URLs that exceed the filesystem
 # path-length limit. The actual documentation text lives inline in the

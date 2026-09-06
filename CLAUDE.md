@@ -11,7 +11,7 @@ FLOW/
 ├── CLAUDE.md          this file
 ├── docs/
 │   ├── static/        00-08 + the raw Breeze API doc dumps. Reference material.
-│   └── dynamic/       decisions.md, findings.md. Our working record.
+│   └── dynamic/       decisions.md, findings.md, nautilus_checklist.md. Our working record.
 ├── experiments/        small throwaway scripts to resolve ambiguity empirically
 └── flow/               the actual project code — stays empty for now
 ```
@@ -21,10 +21,12 @@ FLOW/
   are the fixed reference point everything else argues against. If something
   in here turns out to be wrong, that's a `findings.md`/`decisions.md` entry,
   not an edit to the static file.
-- **`docs/dynamic/`** — `decisions.md` and `findings.md`. These evolve
-  continuously as we work; see their own headers for the distinction between
-  the two (decisions are closed answers, findings are the evidence behind
-  them).
+- **`docs/dynamic/`** — `decisions.md`, `findings.md`, and
+  `nautilus_checklist.md`. These evolve continuously as we work; see their
+  own headers for the distinction (decisions are closed answers, findings
+  are the evidence behind them, the checklist is a living, in-place-updated
+  list of what's been sanity-tested about NautilusTrader versus still
+  assumed — not append-only like findings.md).
 - **`experiments/`** — small, disposable scripts/notebooks to empirically
   resolve anything ambiguous or undocumented that couldn't be settled by
   reading docs alone (example: the 1-second historical interval conflict in
