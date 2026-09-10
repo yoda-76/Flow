@@ -13,27 +13,49 @@ reproducible.
 
 ## Where things stand
 
-Early stage: this is architecture and data-layer work, not a working
-trading system yet. Nothing in the feature layer (volume profile, footprint,
-delta, GEX) is built — those are specified and decided, not written.
+Past pure data-layer work now: the pipeline runs end to end, from raw
+historical downloads through a feature layer to a NautilusTrader backtest
+that produces real, cost-adjusted PnL. No strategy here has a demonstrated
+edge yet — that isn't the point yet. The point so far has been proving
+every link in the chain is trustworthy before anything gets built on top
+of it, and a couple of the bugs caught along the way (below) are exactly
+the kind that would otherwise have quietly produced a flattering, wrong
+backtest.
 
-What *is* built is the bottom of the stack:
+What's built:
 
 - **Breeze historical adapters** for index, futures and NIFTY front-weekly
   option chains, with the request-chunking and auth quirks that were
-  confirmed empirically rather than read off the docs.
+  confirmed empirically rather than read off the docs. Full history is
+  downloaded for index and futures; the options chain is downloading in
+  daily, request-budget-capped installments (D-50).
 - **Canonical layer** — long-form schema, normalization from raw Breeze
   responses, and idempotent Parquet writes partitioned by
   `(instrument_type, year, month)`.
 - **Instrument master and expiry calendar**, built from NSE F&O bhavcopy
   history across both the legacy and UDiFF formats, with a time-versioned
   accessor for the facts that genuinely can't be computed from a rule.
+- **Feature layer** — Greeks (the generalized Black-Scholes/Black-76
+  model, verified to 1e-12 against an independent reference library) and
+  GEX, run against the real downloaded chain. GEX is computed under both
+  possible dealer-positioning conventions rather than assuming one, since
+  which (if either) holds for NSE specifically is still an open question.
+- **Dhan live feed** — a WebSocket market-data module with a real-time
+  volume-profile engine on top. Offline-verified; not yet run against a
+  live trading session.
+- **Backtest harness** (`flow/backtest/`, [its own README](flow/backtest/README.md)
+  covers how to add a strategy) — a NautilusTrader pipeline with two
+  example strategies proving the wiring end to end: real order execution,
+  real fills, a real per-order commission model. Two real bugs were caught
+  and fixed while building it — a backtest that was silently commission-
+  free, and short-sell orders being silently rejected without either
+  strategy noticing — see `docs/dynamic/findings.md`.
 
 A lot of what's here so far is *verification* rather than building —
-actually testing what Breeze's and Dhan's APIs (and third-party libraries
-like NautilusTrader) really do, rather than trusting their docs. That's
-found several real, undocumented bugs and quirks along the way; see
-`docs/dynamic/findings.md` for the running record.
+actually testing what Breeze's, Dhan's, and NautilusTrader's APIs really
+do, rather than trusting their docs. That's found several real,
+undocumented bugs and quirks along the way; see `docs/dynamic/findings.md`
+for the running record.
 
 ## Repo layout
 
@@ -59,7 +81,7 @@ found several real, undocumented bugs and quirks along the way; see
   actually compute what it claims). Not production code — the answers they
   produce end up in `findings.md`.
 - **`flow/`** — the actual system, built incrementally as the architecture
-  solidifies. Three modules so far, mirroring the layer model (D-42); see
+  solidifies. Six modules so far, mirroring the layer model (D-42); see
   below.
 - **`SecurityMaster/`** — raw NSE/Breeze instrument listing reference
   dumps.
@@ -70,9 +92,12 @@ found several real, undocumented bugs and quirks along the way; see
 
 ```
 flow/
-  adapters/     RAW        Breeze client, chunking, index/futures/options downloads
-  canonical/    CANONICAL  schema, normalization, partitioned Parquet writes
-  rules/        —          bhavcopy access, instrument master, time-versioned lookups
+  adapters/     RAW                Breeze + Dhan clients, chunking, index/futures/options downloads
+  canonical/    CANONICAL          schema, normalization, partitioned Parquet writes
+  rules/        —                  bhavcopy access, instrument master, time-versioned lookups
+  features/     FEATURES           Greeks, GEX, volume profile
+  live/         RAW (real-time)    Dhan live-feed recorder
+  backtest/     STRATEGY/EXECUTION NautilusTrader harness, one folder per strategy
 ```
 
 **`adapters/`** — `breeze.py` wraps the Breeze historical endpoints with the
@@ -84,7 +109,10 @@ size under the ~1000-candle cap. `chunking.py` implements that pairing
 without hardcoding weekday-of-week, since NIFTY's expiry weekday has shifted
 historically. `download_options.py` is built to run in daily installments
 against Breeze's ~5,000 requests/day cap and a session token that expires
-daily, and is resumable across runs.
+daily, and is resumable across runs (`raw_io.py` tracks a chunk as done by
+a real `Status: 200`, not by whether it happened to contain any rows — an
+empty-but-valid response, like a holiday, isn't a hole to keep retrying).
+`dhan.py` wraps Dhan's REST auth and live WebSocket feed the same way.
 
 **`canonical/`** — one long-form table for all instrument types
 (`timestamp, instrument_id, o, h, l, c, v, oi`), timestamps tz-aware
@@ -100,6 +128,33 @@ contract-specific facts (lot size, tick size, strike), which are looked up
 exactly by `instrument_id`, from genuinely date-only facts (expiry existence
 and ordering), which are looked up "as of" a date because they can't be
 computed — NIFTY's expiry weekday has moved more than once.
+
+**`features/`** — `greeks.py` is the scalar reference implementation
+(generalized Black-Scholes with a cost-of-carry parameter, so spot-based and
+futures-based pricing are the same function, not two implementations);
+`greeks_batch.py` is a numpy-vectorized version cross-validated against it
+on every run, since a vectorized rewrite is exactly the kind of thing that
+silently drifts from its own reference. `gex.py` computes gamma exposure
+under both possible dealer-positioning sign conventions rather than
+picking one, since that's a genuinely open, NSE-specific question — not
+something to assume from a US-market convention. `volume_profile.py`
+implements fixed-tick-bin sizing and a rolling-local-average HVN/LVN test.
+
+**`live/`** — `dhan_volume_profile_recorder.py` subscribes to Dhan's live
+feed and builds a running volume profile from real tick deltas, logging
+every parsed tick to disk unconditionally so the raw record survives even
+if the live feature computation has a bug.
+
+**`backtest/`** — a NautilusTrader harness, one folder per strategy
+(`gex_regime_follower/`, `ma_crossover_futures/`) with genuinely shared
+code (data loading, venue/fee-model setup, the order-execution adapter)
+factored into `common/` only once a second strategy actually needed it.
+**[flow/backtest/README.md](flow/backtest/README.md) is the guide for
+turning a strategy idea into a runnable, trustworthy backtest script** —
+how the signal/execution split works, what to reuse from `common/`, and
+the specific bug signatures (silently-free backtests, silently-rejected
+short orders, a pandas footgun in Nautilus's own result reporting) to
+check for before trusting a result.
 
 ## The core habit worth noticing
 
@@ -121,11 +176,12 @@ Two examples of why this is worth the time:
 
 ## Roadmap
 
-Next, in order (D-47): a trivial futures strategy end-to-end to prove the
-layering works, then GEX reversal, then order flow last. Order flow
-constructs are validated forward only — no historical approximation
-(D-46), since tick-level history at that granularity isn't something this
-project sources or stores.
+D-47's order: a trivial strategy end-to-end to prove the layering works
+(done — two of them, `flow/backtest/`, neither with a real edge by
+design), then GEX reversal, then order flow last. Order flow constructs
+are validated forward only — no historical approximation (D-46), since
+tick-level history at that granularity isn't something this project
+sources or stores.
 
 ## Notes
 
