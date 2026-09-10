@@ -5,16 +5,17 @@ D-49's manual daily session token.
 
 Resumable by construction: each chunk writes one raw file
 (flow/data/raw/breeze/index/{underlying}/{chunk_start}_{chunk_end}.json) and
-a chunk is skipped if that file already holds a non-empty "Success" list --
-safe to Ctrl-C and re-run, or split across multiple days if a wider pull
-(futures/options) ever needs more than one day's request budget.
+a chunk is skipped once that file holds a definitive (Status 200) response
+-- an empty Success list still counts as done (real: e.g. a holiday), not
+a hole to keep retrying. Safe to Ctrl-C and re-run, or split across
+multiple days if a wider pull (futures/options) ever needs more than one
+day's request budget.
 
 Usage:
     .venv/Scripts/python.exe -m adapters.download_index --start 2024-01-01 --end 2026-09-07
 """
 
 import argparse
-import json
 import sys
 import time
 from datetime import date, datetime
@@ -23,19 +24,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from adapters.breeze import authenticate, pull_index_history, save_raw  # noqa: E402
 from adapters.chunking import two_day_chunks  # noqa: E402
+from adapters.raw_io import is_saved  # noqa: E402
 
 RAW_ROOT = Path(__file__).resolve().parent.parent / "data" / "raw" / "breeze" / "index"
 MARKET_OPEN, MARKET_CLOSE = "09:15:00", "15:30:00"
-
-
-def _already_done(out_path: Path) -> bool:
-    if not out_path.exists():
-        return False
-    try:
-        record = json.loads(out_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-    return bool((record.get("response") or {}).get("Success"))
 
 
 def main():
@@ -53,7 +45,7 @@ def main():
     out_dir = RAW_ROOT / args.underlying
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pending = [c for c in chunks if not _already_done(out_dir / f"{c[0].isoformat()}_{c[1].isoformat()}.json")]
+    pending = [c for c in chunks if not is_saved(out_dir / f"{c[0].isoformat()}_{c[1].isoformat()}.json")]
     print(f"{len(chunks)} chunks total, {len(chunks) - len(pending)} already done, {len(pending)} to fetch")
     if not pending:
         return
@@ -72,7 +64,7 @@ def main():
                 "product_type": "cash", "exchange_code": "NSE",
             }
             save_raw(response, request_meta, out_path)
-            if response.get("Success"):
+            if response.get("Status") == 200:
                 ok += 1
             else:
                 failed.append((c_start, c_end, response.get("Error")))

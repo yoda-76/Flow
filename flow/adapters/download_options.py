@@ -17,16 +17,17 @@ D-50's budget is ~89K requests, well over Breeze's ~5,000/day cap, and the
 session token expires daily (D-49) regardless. So this script is designed
 to run in daily installments: --max-requests caps how many new requests one
 invocation makes (default 4500, leaving headroom under the cap), and
-resumability (skipping chunks whose raw file already holds a non-empty
-"Success") means re-running with a fresh token the next day picks up
-exactly where the last run stopped.
+resumability (skipping chunks whose raw file already holds a definitive
+Status-200 response -- an empty Success is a real, valid "no trades this
+window", common for deep ITM/OTM strikes, not a hole to keep retrying)
+means re-running with a fresh token the next day picks up exactly where
+the last run stopped.
 
 Usage (repeat daily with a fresh Breeze session token until "0 to fetch"):
     .venv/Scripts/python.exe -m adapters.download_options --start 2024-01-01 --end 2026-09-04
 """
 
 import argparse
-import json
 import sys
 import time
 from collections import defaultdict
@@ -36,6 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from adapters.breeze import authenticate, pull_option_history, save_raw  # noqa: E402
 from adapters.chunking import pair_days, trading_days  # noqa: E402
+from adapters.raw_io import is_saved  # noqa: E402
 from rules.store import MarketRulesStore  # noqa: E402
 
 RAW_ROOT = Path(__file__).resolve().parent.parent / "data" / "raw" / "breeze" / "options"
@@ -76,16 +78,6 @@ def build_contract_chunks(store, underlying, start, end, instrument_type="IDO"):
     return chunks
 
 
-def _already_done(out_path: Path) -> bool:
-    if not out_path.exists():
-        return False
-    try:
-        record = json.loads(out_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-    return bool((record.get("response") or {}).get("Success"))
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", required=True, help="YYYY-MM-DD")
@@ -106,7 +98,7 @@ def main():
     pending = []
     for c_start, c_end, instrument_id, expiry, strike, right in chunks:
         out_path = RAW_ROOT / args.underlying / expiry / f"{strike}_{right}" / f"{c_start.isoformat()}_{c_end.isoformat()}.json"
-        if not _already_done(out_path):
+        if not is_saved(out_path):
             pending.append((c_start, c_end, instrument_id, expiry, strike, right, out_path))
 
     print(f"{len(chunks)} chunks total, {len(chunks) - len(pending)} already done, {len(pending)} remaining")
@@ -131,7 +123,7 @@ def main():
                 "product_type": "options", "exchange_code": "NFO",
             }
             save_raw(response, request_meta, out_path)
-            if response.get("Success"):
+            if response.get("Status") == 200:
                 ok += 1
             else:
                 failed.append((c_start, c_end, instrument_id, response.get("Error")))

@@ -1091,6 +1091,232 @@ volume policy).
 Next: front-weekly options download, per D-50's already-computed budget
 (~89.2K requests at 2-day chunking, 18 days at the 5,000/day cap).
 
+**[LIVE/CODE]** Front-weekly options download started (`flow/adapters/
+download_options.py`, new) -- for each trading day, front-weekly expiry is
+resolved via `rules_as_of()`, days grouped by expiry, and every strike/right
+listed in the instrument master for that expiry gets its own 2-day-chunked
+pull restricted to its actual `[valid_from, valid_to]` window. 84,077 total
+chunks for the full 2024-01-01 to 2026-09-07 range (bigger than D-50's
+prior ~89.2K *request* estimate would suggest per-chunk, since that number
+was requests not distinct contract/date units -- consistent order of
+magnitude). --max-requests caps each run (Breeze's daily cap and D-49's
+daily token both force multi-day installments regardless).
+
+Found the resumability check had a real bug, caught immediately on the
+first day's run: Breeze returns `Status:200, Error:None, Success:[]` for a
+deep ITM/OTM strike with literally zero trades in a window -- confirmed
+directly (18350 CE on 2024-01-01/02, ~3350 points ITM, empty but genuinely
+successful). The original check (`bool(Success)`) treated this the same as
+"never fetched" and would have silently re-fetched every illiquid strike
+forever, burning budget without ever converging. Fixed by keying
+resumability on `Status == 200` instead (`flow/adapters/raw_io.py`, new,
+shared by all three download_*.py scripts) -- a chunk is "done" once
+Breeze gave a definitive answer, empty or not; only a missing file, a
+corrupt file, or a non-200 response triggers a retry. Also surfaced (not
+a bug, background context): the first day's run was killed mid-flight by
+something outside the script itself (not a crash, no exception in the
+partial output) -- resuming with the same command picked up cleanly with
+zero data loss, which is the resumability design working as intended.
+
+---
+
+**[CODE/LIVE]** Dhan live-feed volume-profile module ported from the S-03
+experiment spike into `flow/` proper (`flow/adapters/dhan.py`,
+`flow/features/volume_profile.py`, `flow/live/dhan_volume_profile_recorder.py`).
+While porting, found the experiment spike's bin-sizing and HVN/LVN logic
+did NOT match D-22 (fixed-tick-multiple bins; HVN/LVN via a rolling-local-
+average relative threshold, not local-peak/trough detection) — reimplemented
+correctly, offline self-tests confirm the rolling-average method catches a
+planted spike/trough a flat control doesn't false-positive on. Not yet
+live-verified (market closed) — see `docs/dynamic/context.md` for what
+remains UNVERIFIED until a real trading-day run.
+
+**[CODE]** Greeks feature engine built (`flow/features/greeks.py`, D-19/R7).
+D-19 is still formally OPEN (blocked on S-04's underlying-reference
+question), so the module takes cost-of-carry `b` as a required argument
+rather than assuming spot or future — same "one function, a parameter
+choice" finding already confirmed earlier in this file. European
+closed-form only (D-54: NSE index options are European, so `exercise_style=
+"american"` raises `NotImplementedError` rather than silently computing a
+wrong value). IV solver returns `None` on failure (deep ITM/OTM, no-
+arbitrage violations, non-convergence) — never a guess, per D-19's still-
+open "null, flag, or interpolate" question resolved toward null for now.
+
+Verified two ways: (1) dependency-free self-tests — put-call parity exact
+to 1e-8 for both b=r (spot) and b=0 (future) cases, delta/gamma/vega
+put-call symmetries, IV round-trip recovery, no-arbitrage-floor rejection
+returning None correctly, American-style guard raising correctly; (2)
+independent cross-check against `py_vollib` (a separately-authored
+library, already used for this exact purpose earlier — see the D-19/D-21
+Greeks-verification section above) on an ITM call, correcting for
+`py_vollib`'s different vega (%vol) and theta (calendar-day) conventions
+rather than assuming raw units match: price, delta, gamma, vega, theta,
+and IV all agreed to within 1e-12 (i.e. exact to floating-point precision).
+
+Next: GEX — blocked on D-20/D-21 (dealer-positioning convention, S-05;
+underlying reference, S-04), neither closed. Both need real NSE-specific
+empirical work, not just an implementation.
+
+**[CODE]** `flow/features/greeks_batch.py` (new): vectorized (numpy/scipy)
+batch version of `greeks.py`'s scalar Greeks engine, cross-validated against
+it on every run (`__main__` block) rather than trusted blindly. First
+cross-validation run caught a real bug: the original stability guard
+(`vega > 1e-8`) was far too permissive for this instrument's price scale
+(NIFTY vega is normally in the thousands) — a deep-ITM put 1.9 days from
+expiry "converged" in price-space to an IV 0.045 away from the scalar
+solver's answer, because many different vols price almost identically once
+vega is near zero. Fixed by requiring `vega > 1.0` (raw units) to accept a
+Newton convergence at all, not just to decide whether to take another
+step — re-validated to agree with the scalar reference to 6.57e-05 max IV
+diff, 9e-13 max greek diff, with 95.2% convergence on a 500-row synthetic
+sample.
+
+Run against the full downloaded options history (5,111,950 canonical
+rows): 3,938,716 rows had valid inputs (t>0), of which **58.5% solved for
+IV** (2,305,001 rows) — a real, empirical answer to D-19/S-04's open
+"what fraction of a real chain fails?" checklist item. Failures
+concentrate in short-dated options (median ~4 days to expiry) — expected
+given D-50's front-weekly-only download scope means a large fraction of
+the chain is inherently close to expiry, where vega genuinely collapses
+across a wide range of strikes, not just deep ITM/OTM ones.
+
+**[LIVE]** `flow/features/gex.py` extended with `compute_gex_timeseries()`
+(vectorized full-history version, no per-bar Python loop) and run for
+real — surfaced that GEX needs `lot_size`, and virtually the entire
+downloaded range so far sits in the pre-UDiFF legacy era (no lot-size
+column, D-06/D-52), so only 3,133 of 2.3M Greeks-solved rows (one single
+day, the original smoke-test week) were initially GEX-computable. Chasing
+this down further (below) fixed it properly rather than working around it.
+
+**[LIVE] D-06/D-52 correction — legacy-era lot size confirmed as 25, not a
+guess.** The user proposed assuming 50 units/lot for the un-backfillable
+legacy-era gap; checked against real data first rather than applying it.
+Direct evidence contradicts 50: every one of 1,220 contracts expiring
+2024-07-11 through 2024-08-14 (immediately after the UDiFF cutover) shows
+`lot_size=25`, zero exceptions, and the first lot-size transition of any
+kind isn't until 2024-11-22 (25→75) — over four months later — so nothing
+in the data supports a transition happening any earlier, let alone landing
+on 50. Also confirmed (by directly inspecting canonical data) that
+lot_size is the *only* gap in the legacy era — open_interest, volume, and
+close price are 100% populated throughout, since those come from Breeze's
+own historical API, not bhavcopy, so the legacy/UDiFF bhavcopy split
+doesn't touch them at all.
+
+While verifying this, also found and fixed a real (small, pre-existing)
+bug in `build_instrument_master.py`'s per-contract lot-size backfill: 11
+instrument_ids (all the same deep, essentially-dormant strike (17000)
+across 2025-2028 expiries, each observed only *once* in the UDiFF era, on
+2025-03-03 with `lot_size=75`) had that later, already-changed value
+incorrectly stamped all the way back to their legacy-era listing dates in
+Jan 2024 — silently implying 75 applied to a period where the confirmed
+real value was 25. Fixed by computing a `market_wide_baseline` (the
+confirmed lot size at the very first UDiFF-era observation for the
+underlying) and refusing to backward-extend a per-contract value that
+disagrees with it; the legacy-era portion of a disagreeing contract's
+window gets the baseline instead, and any remaining gap between the
+legacy era's end and that contract's own first real observation is left
+honestly uncovered rather than bridged. Full comment trail in
+`build_instrument_master.py` itself.
+
+Rebuilt the instrument master with the fix: legacy-era null lot_size rows
+went from 5,150 to 0 for NIFTY options, the 11 anomalous contracts now
+correctly show two disjoint periods (25 through 2024-07-07, 75 from
+2025-03-03) instead of one wrong bridged period, and `rules.store`
+validation stays clean. Re-ran the Greeks/GEX pipeline against the fixed
+data: lot_size lookup failures dropped from 2,876/2,879 distinct
+instrument_ids to **0/2,879** — GEX is now computable across 64 distinct
+trading days spanning the *entire* downloaded range so far (Jan 2024
+through Aug 2026), not just the one smoke-test day. This coverage will
+keep expanding automatically as the options download continues, with no
+further pipeline changes needed.
+
+**[CODE/LIVE] First two NautilusTrader backtests — a real short-selling
+bug corrected the initially-reported results.** Built `flow/backtest/`
+(restructured per-strategy, `common/` for shared Nautilus wiring):
+`gex_regime_follower` (GEX-based directional, NIFTY index, both dealer
+conventions per the user's decision) and `ma_crossover_futures` (simple
+20/100-bar MA crossover, NIFTY continuous front-month futures via
+`rules.store.MarketRulesStore.front_contract()`, full Jan 2024–Sep 2026
+history).
+
+Both engines ran end-to-end (real orders, fills, positions, Nautilus's
+own PnL) and were **initially reported as: standard GEX +577 INR /
+inverted -906.55 INR; MA crossover +3,137.75 INR** — all wrong. Both
+runs used `AccountType.CASH`, which silently **rejects every short-sell
+order** (`OrderRejected: "SHORT SELLING not permitted on a CASH
+account"`). The `TargetPositionStrategy` adapter re-submits a rejected
+order on every subsequent bar for as long as the target stays short,
+which is what produced MA crossover's absurd 124,005 "flips" — confirmed
+by isolating the pure signal (`signal.py`, no Nautilus): it only actually
+changes value ~170 times per 1.5 months of real data, nowhere close to
+124,005 over 2.7 years. The short side of both strategies never traded
+at all in the original runs.
+
+Fixed by switching to `AccountType.MARGIN` with `default_leverage=1`
+(same economics as CASH, just permits shorting) — factored into
+`flow/backtest/common/engine_setup.py` specifically so this can't be
+independently re-broken per strategy. Corrected results:
+
+| | GEX standard | GEX inverted | MA crossover |
+|---|---|---|---|
+| Window | Jan–Apr 2024 | Jan–Apr 2024 | Jan 2024–Sep 2026 |
+| Flips | 3,387 | 3,387 (identical, exact mirror) | 3,434 |
+| Realized PnL | +1,483.55 INR | -1,483.55 INR (exact negation) | +4,104.10 INR |
+| Win rate | 56.5% | 42.9% | 31.3% |
+
+All on 10,000,000 INR starting capital, zero commission/slippage modeled
+— every one of these PnL figures is still statistical noise (0.01–0.04%
+of capital), not a demonstrated edge in either direction. The real
+takeaway from this round wasn't the PnL — it was catching a bug that
+would have made every future backtest's short side silently fake. Lesson
+generalized into `common/engine_setup.py` so the next strategy inherits
+the fix rather than repeating the mistake a third time.
+
+Also caught in the same round: `wrangle_bars()` (`common/data_loading.py`)
+crashed on the full futures run — Nautilus's `Quantity` type rejects NaN
+outright, and canonical futures data has 53 rows with genuinely unknown
+(nulled, not zeroed) volume, the same Breeze data-quality gap documented
+earlier for options. Fixed by dropping those rows before wrangling
+(logged, not silently zeroed) rather than crashing or fabricating a
+volume.
+
+**[CODE] Fee model added — Nautilus already has the machinery, it just
+wasn't wired in.** User asked directly whether Nautilus handles cost
+modeling; checked the actual source
+(`nautilus_trader/backtest/models/fee.pyx`) rather than assuming. It
+does: a `FeeModel` base class plus three real implementations
+(`FixedFeeModel`, `PerContractFeeModel`, `MakerTakerFeeModel`). But
+`add_venue()`'s `fee_model` param defaults to `None`, and neither
+strategy's `run_backtest.py` passed one, so both backtests above ran
+completely commission-free without that being obvious from the results
+alone. Fixed in `common/engine_setup.py`: `add_standard_venue()` now
+defaults to `FixedFeeModel` with a flat placeholder commission
+(₹20/order, documented as a round approximation of discount-broker
+brokerage, not a real NSE cost schedule — STT/GST/exchange charges are a
+further refinement, not attempted here).
+
+Re-ran both strategies with the fee model applied — the purpose of this
+whole exercise (per the user: "the strategy doesn't have to have an edge
+... the goal is a repeatable model so when I plug in an actually
+profitable strategy, I see actual results") is exactly what this shows:
+
+| | GEX standard | GEX inverted | MA crossover |
+|---|---|---|---|
+| Closed positions / fills | 3,387 / 6,774 | 3,387 / 6,774 | 3,434 / 6,868 |
+| PnL before costs | +1,483.55 | -1,483.55 | +4,104.10 |
+| PnL after ₹20/order costs | **-133,996.45** | **-136,963.55** | **-133,255.90** |
+| Win rate after costs | 1.4% | 2.3% | 16.0% |
+
+The commission drop matches exactly (6,774 × ₹20 = ₹135,480 vs. the
+1,483.55 → -133,996.45 swing; 6,868 × ₹20 = ₹137,360 vs. the 4,104.10 →
+-133,255.90 swing) — confirms the fee model is applying correctly, not
+just plausible-looking. All three strategies were already noise-level
+before costs; now decisively negative after them, which is the honest,
+expected outcome for a ~3,400-trade, no-edge v1 signal at this cost
+level. The pipeline is doing its job: it will show a real profitable
+strategy's edge net of these same costs, not a flattering cost-free
+fiction.
+
 ---
 
 *Next: still open — 1-second confirmed on equity cash but not yet directly on

@@ -18,3 +18,9 @@ nautilus_trader
 # black_scholes_greeks/imply_vol_and_greeks against a separately-authored
 # library on synthetic inputs -- see docs/dynamic/findings.md D-19 section
 py_vollib
+
+# Official Dhan SDK -- used for its MarketFeed class, which handles the
+# live WebSocket feed's binary packet parsing. Used in preference to a
+# hand-rolled parser since there's no local doc dump with exact byte
+# layouts (unlike Breeze's), see dhan_live_volume_profile.py's docstring.
+dhanhq

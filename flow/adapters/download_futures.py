@@ -14,14 +14,13 @@ expiry_date.
 
 Resumable the same way as download_index.py: each chunk writes one raw file
 under flow/data/raw/breeze/futures/{underlying}/{expiry}/, skipped on
-re-run if it already holds a non-empty "Success" list.
+re-run once it holds a definitive (Status 200) response.
 
 Usage:
     .venv/Scripts/python.exe -m adapters.download_futures --start 2024-01-01 --end 2026-09-04
 """
 
 import argparse
-import json
 import sys
 import time
 from collections import defaultdict
@@ -31,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from adapters.breeze import authenticate, pull_future_history, save_raw  # noqa: E402
 from adapters.chunking import trading_days  # noqa: E402
+from adapters.raw_io import is_saved  # noqa: E402
 from rules.store import MarketRulesStore  # noqa: E402
 
 RAW_ROOT = Path(__file__).resolve().parent.parent / "data" / "raw" / "breeze" / "futures"
@@ -65,16 +65,6 @@ def chunk_by_front_contract(store, underlying, start, end, instrument_type="IDF"
     return chunks
 
 
-def _already_done(out_path: Path) -> bool:
-    if not out_path.exists():
-        return False
-    try:
-        record = json.loads(out_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-    return bool((record.get("response") or {}).get("Success"))
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", required=True, help="YYYY-MM-DD")
@@ -93,7 +83,7 @@ def main():
     for c_start, c_end, instrument_id in chunks:
         expiry = instrument_id.split("|")[2]
         out_path = RAW_ROOT / args.underlying / expiry / f"{c_start.isoformat()}_{c_end.isoformat()}.json"
-        if not _already_done(out_path):
+        if not is_saved(out_path):
             pending.append((c_start, c_end, instrument_id, expiry, out_path))
 
     print(f"{len(chunks)} chunks total, {len(chunks) - len(pending)} already done, {len(pending)} to fetch")
@@ -114,7 +104,7 @@ def main():
                 "product_type": "futures", "exchange_code": "NFO",
             }
             save_raw(response, request_meta, out_path)
-            if response.get("Success"):
+            if response.get("Status") == 200:
                 ok += 1
             else:
                 failed.append((c_start, c_end, instrument_id, response.get("Error")))

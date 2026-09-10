@@ -7,6 +7,27 @@ jugaad-data
 pandas==2.3.3
 pyarrow
 duckdb
+
+# D-28 stays formally DEFERRED (not a closed adoption decision), but the
+# GEX-based backtest strategy needs a real backtest engine to run against
+# -- reusing the same version already spike-tested in experiments/
+# (BarDataWrangler, ParquetDataCatalog, custom Data types all confirmed
+# working there, docs/dynamic/findings.md D-28 section).
+nautilus_trader==1.231.0
+
 python-dotenv
 requests
 breeze-connect
+
+# Official Dhan SDK -- used for its MarketFeed class, which handles the
+# live WebSocket feed's binary packet parsing. Used in preference to a
+# hand-rolled parser since there's no local doc dump with exact byte
+# layouts (unlike Breeze's), see adapters/dhan.py's docstring.
+dhanhq
+
+# scipy.special.ndtr -- exact, vectorized normal CDF for batch Greeks
+# computation over a full options chain at once (features/greeks_batch.py).
+# features/greeks.py's own scalar reference implementation stays
+# dependency-free (math.erf only) -- this is only for the numpy-vectorized
+# batch path, cross-validated against that scalar reference.
+scipy

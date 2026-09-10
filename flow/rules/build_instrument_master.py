@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .bhavcopy import fetch_fo_bhavcopy, parse_fo_bhavcopy
+from .bhavcopy import UDIFF_START_DATE, fetch_fo_bhavcopy, parse_fo_bhavcopy
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_OUT_DIR = HERE.parent / "data" / "reference"
@@ -92,6 +92,7 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
     instrument_days = {}     # instrument_id -> [(date, lot_size, token), ...]
     instrument_static = {}   # instrument_id -> {underlying, instrument_type, expiry, strike, option_type}
     expiry_first_seen = {}   # (underlying, instrument_type, expiry) -> first date observed
+    daily_lot_values = {}    # (underlying, date) -> set of lot sizes seen that day (any instrument_type)
 
     days_scanned, days_skipped = 0, 0
     legacy_days_scanned = 0
@@ -127,6 +128,7 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
 
             if lot is not None:
                 seen_lot_today.setdefault(underlying, set()).add(lot)
+                daily_lot_values.setdefault((underlying, d), set()).add(lot)
 
             key = (underlying, itype, expiry)
             if key not in expiry_first_seen:
@@ -136,9 +138,38 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
             if len(lots) > 1:
                 transition_days.append(f"{d}: {underlying} had {len(lots)} lot sizes active at once: {lots} (grandfathering, not an error)")
 
+    # Market-wide lot size confirmed in effect at the very start of the
+    # UDiFF era (2024-07-08), per underlying -- the earliest UDiFF-era date
+    # with a single, unambiguous lot value for that underlying (skips any
+    # same-day transition/grandfathering ambiguity). This is real,
+    # multiply-confirmed evidence, not an assumption: e.g. for NIFTY,
+    # empirically every one of the 1,220 contracts expiring 2024-07-11
+    # through 2024-08-14 shows lot_size=25 with zero exceptions, and the
+    # first detected lot-size transition of any kind is 2024-11-22 (25->75)
+    # -- over four months later. Since NSE lot-size changes are infrequent,
+    # multi-month-stable events (confirmed by that same four-month gap with
+    # zero transitions), and this is the value in effect at the *first*
+    # moment we have any per-day lot data at all, it's the correct value to
+    # assume held continuously back through the pre-UDiFF legacy era too
+    # (2024-01-01 to 2024-07-07), which has no lot-size column and so no
+    # direct per-day evidence of its own. Used below for two purposes: (1)
+    # filling legacy-only contracts (expired entirely before 2024-07-08,
+    # never observed with a real lot value) that would otherwise stay
+    # null forever, and (2) refusing to backward-extend a contract's own
+    # much-later lot observation across a value it doesn't match (see the
+    # backfill loop below).
+    market_wide_baseline = {}
+    for (underlying, d), values in sorted(daily_lot_values.items(), key=lambda kv: kv[0][1]):
+        if d < UDIFF_START_DATE or underlying in market_wide_baseline:
+            continue
+        if len(values) == 1:
+            market_wide_baseline[underlying] = (d, next(iter(values)))
+
     # --- instrument master: one row per (contract, stable-spec period) ---
     instrument_rows = []
     lot_size_backfilled = []  # instrument_ids whose earliest days predate any known lot size (legacy era)
+    lot_size_baseline_filled = []  # legacy-only contracts filled from market_wide_baseline (no per-contract evidence at all)
+    lot_size_conflicting_backfill_skipped = []  # per-contract value disagreed with the baseline -- not extended
     for iid, days in instrument_days.items():
         static = instrument_static[iid]
         is_option = static["option_type"] in ("CE", "PE")
@@ -151,24 +182,74 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
         exchange_token = sorted(tokens_seen)[-1] if tokens_seen else None
 
         true_valid_from = min(d for d, _, _ in days)
+        true_valid_to = max(d for d, _, _ in days)
+        underlying = static["underlying"]
+        baseline = market_wide_baseline.get(underlying)  # (date, value) or None
+
         lot_days = sorted((d, lot) for d, lot, _ in days if lot is not None)
         if lot_days:
             periods = collapse_periods(lot_days)
             if periods[0]["valid_from"] > true_valid_from:
-                # This instrument_id was observed earlier than any known lot
-                # size (pre-UDiFF legacy days, which have no lot-size
-                # column at all) -- backward-extend the earliest known
-                # value rather than leave a gap. NIFTY's lot size is stable
-                # for long stretches (confirmed: 25 held from well before
-                # 2024-07-08 through 2024-11-22), so this is a reasonable,
-                # explicitly-logged assumption, not a silent one.
-                lot_size_backfilled.append(f"{iid}: backfilled lot_size={periods[0]['value']} to {true_valid_from} (legacy era, no lot-size column)")
-                periods[0]["valid_from"] = true_valid_from
+                if baseline is not None and periods[0]["value"] != baseline[1]:
+                    # This contract's own first known lot value does NOT
+                    # match the confirmed market-wide baseline at UDiFF
+                    # start -- a real lot-size transition happened
+                    # somewhere between true_valid_from and this
+                    # contract's first observation, so blindly
+                    # backward-extending this later (and different) value
+                    # would silently misattribute it to a period it never
+                    # applied to. Caught empirically while building this:
+                    # 11 deep, essentially-dormant 2025-2028-expiry
+                    # contracts (all strike=17000) were each observed only
+                    # once, in mid-2025 with lot_size=75, and this logic
+                    # previously stamped 75 all the way back to their
+                    # legacy-era listing in Jan 2024 -- when the confirmed
+                    # value for that whole stretch was actually 25.
+                    #
+                    # Fix: do NOT extend using this contract's own
+                    # mismatched value. Instead, if part of its unexplained
+                    # span falls in the legacy era (no lot-size column,
+                    # true unknown), fill *that* portion with the
+                    # confirmed baseline instead -- still real evidence,
+                    # just market-wide rather than per-contract. Any
+                    # remaining gap between the legacy era's end and this
+                    # contract's own first observation is left alone
+                    # (i.e., simply not covered by any period here) rather
+                    # than guessed -- an honest gap, not a fabricated
+                    # bridge.
+                    lot_size_conflicting_backfill_skipped.append(
+                        f"{iid}: first known lot_size={periods[0]['value']} (from {periods[0]['valid_from']}) "
+                        f"disagrees with the {underlying} baseline={baseline[1]} confirmed at {baseline[0]} -- "
+                        f"not backward-extended"
+                    )
+                    if true_valid_from < UDIFF_START_DATE:
+                        first_known_valid_from = periods[0]["valid_from"]
+                        legacy_end = min(UDIFF_START_DATE - timedelta(days=1), first_known_valid_from - timedelta(days=1))
+                        if legacy_end >= true_valid_from:
+                            periods.insert(0, {"value": baseline[1], "valid_from": true_valid_from, "valid_to": legacy_end})
+                            lot_size_baseline_filled.append(
+                                f"{iid}: filled lot_size={baseline[1]} for {true_valid_from} to {legacy_end} "
+                                f"(market-wide baseline, per-contract value at {first_known_valid_from} disagreed)"
+                            )
+                else:
+                    # Matches the confirmed baseline (or no baseline exists
+                    # to check against) -- safe to backward-extend, same as
+                    # before.
+                    lot_size_backfilled.append(f"{iid}: backfilled lot_size={periods[0]['value']} to {true_valid_from} (legacy era, no lot-size column)")
+                    periods[0]["valid_from"] = true_valid_from
+        elif baseline is not None and true_valid_to < UDIFF_START_DATE:
+            # Never observed with a known lot size at all (legacy-only
+            # contract, expired entirely before UDiFF), but the confirmed
+            # market-wide baseline covers this whole window with zero
+            # detected transitions in between -- use it rather than leave
+            # a recoverable value null.
+            periods = [{"value": baseline[1], "valid_from": true_valid_from, "valid_to": true_valid_to}]
+            lot_size_baseline_filled.append(f"{iid}: filled lot_size={baseline[1]} for {true_valid_from} to {true_valid_to} (market-wide baseline, no per-contract evidence at all)")
         else:
-            # Never observed with a known lot size at all -- contract
-            # existed and expired entirely within the legacy era. Can't
-            # source a real value; leave it null rather than guess.
-            periods = [{"value": None, "valid_from": true_valid_from, "valid_to": max(d for d, _, _ in days)}]
+            # Never observed with a known lot size, and either no baseline
+            # exists for this underlying or this contract's window isn't
+            # safely covered by it -- leave null rather than guess.
+            periods = [{"value": None, "valid_from": true_valid_from, "valid_to": true_valid_to}]
 
         for period in periods:
             instrument_rows.append({
@@ -217,7 +298,10 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
         "legacy_days_scanned": legacy_days_scanned,
         "lot_size_transition_days": transition_days,
         "token_reuse_within_one_instrument_id": token_reuse_warnings,
+        "lot_size_market_wide_baseline_at_udiff_start": {u: {"date": str(d), "value": v} for u, (d, v) in market_wide_baseline.items()},
         "lot_size_backfilled_from_legacy_era": lot_size_backfilled,
+        "lot_size_baseline_filled": lot_size_baseline_filled,
+        "lot_size_conflicting_backfill_skipped": lot_size_conflicting_backfill_skipped,
         "content_hashes": {
             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in (instrument_path, calendar_path)
@@ -239,6 +323,13 @@ def build(start: date, end: date, underlyings: set, instrument_types: set, out_d
     if lot_size_backfilled:
         print(f"\n{len(lot_size_backfilled)} instrument_ids had lot_size backfilled into the legacy era (no lot-size column pre-2024-07-08):")
         print(" ", lot_size_backfilled[0])
+    if lot_size_baseline_filled:
+        print(f"\n{len(lot_size_baseline_filled)} instrument_ids filled from the market-wide baseline (no per-contract evidence, or per-contract evidence didn't cover the full legacy-era span):")
+        print(" ", lot_size_baseline_filled[0])
+    if lot_size_conflicting_backfill_skipped:
+        print(f"\n{len(lot_size_conflicting_backfill_skipped)} instrument_ids had a per-contract lot_size that disagreed with the market-wide baseline -- NOT backward-extended:")
+        for w in lot_size_conflicting_backfill_skipped[:5]:
+            print(" ", w)
     print(f"\nWritten to {out_dir}")
 
 
