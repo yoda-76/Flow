@@ -41,8 +41,12 @@ What's built:
   possible dealer-positioning conventions rather than assuming one, since
   which (if either) holds for NSE specifically is still an open question.
 - **Dhan live feed** — a WebSocket market-data module with a real-time
-  volume-profile engine on top. Offline-verified; not yet run against a
-  live trading session.
+  volume-profile engine on top. Live-tested for the first time on
+  2026-09-11: POC holds up well as long as the tick stream runs without a
+  gap, but VAH/VAL/HVN/LVN showed real inaccuracy on the same live data —
+  those formulas need iterating against more live sessions (multiple
+  methods, not just the current one) before they're trustworthy the way
+  POC already is.
 - **Backtest harness** (`flow/backtest/`, [its own README](flow/backtest/README.md)
   covers how to add a strategy) — a NautilusTrader pipeline with two
   example strategies proving the wiring end to end: real order execution,
@@ -143,7 +147,11 @@ implements fixed-tick-bin sizing and a rolling-local-average HVN/LVN test.
 **`live/`** — `dhan_volume_profile_recorder.py` subscribes to Dhan's live
 feed and builds a running volume profile from real tick deltas, logging
 every parsed tick to disk unconditionally so the raw record survives even
-if the live feature computation has a bug.
+if the live feature computation has a bug (this paid off on its first
+live run: the process restarted twice, but nothing was lost). POC comes
+out accurate whenever the tick stream itself has no gaps; VAH/VAL/HVN/LVN
+still need real iteration against more live data before they're trusted
+the same way.
 
 **`backtest/`** — a NautilusTrader harness, one folder per strategy
 (`gex_regime_follower/`, `ma_crossover_futures/`) with genuinely shared
